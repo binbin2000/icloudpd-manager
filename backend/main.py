@@ -428,10 +428,37 @@ def _purge_expired_sessions():
         _list_sessions.pop(sid, None)
 
 
-async def _read_stderr_loop(proc, session: dict):
-    """Reads stderr, appends to log, watches for 2FA/trust prompts."""
+# Matches lines that are icloudpd log output rather than actual names.
+# e.g. "2026-04-05 09:29:23 INFO ..." or "2026-04-05 09:29:23 DEBUG ..."
+_LOG_LINE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}\s+(INFO|DEBUG|WARNING|ERROR|CRITICAL)\b")
+
+
+async def _run_icloudpd(session: dict, extra_args: list[str]) -> list[str]:
+    """
+    Runs icloudpd with the given extra args.
+    Returns the list of names printed to stdout.
+    Handles 2FA/trust via a single merged output stream so that prompts are
+    detected regardless of whether icloudpd writes them to stdout or stderr.
+    """
+    cmd = [
+        "icloudpd",
+        "--username", session["username"],
+        "--password", session["password"],
+        "--cookie-directory", COOKIE_DIR,
+        "--no-progress-bar",
+    ] + extra_args
+
+    proc = await asyncio.create_subprocess_exec(
+        *cmd,
+        stdin=asyncio.subprocess.PIPE,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.STDOUT,  # merge stderr into stdout so 2FA prompts are always visible
+    )
+    session["proc"] = proc
+
+    names = []
     while True:
-        line = await proc.stderr.readline()
+        line = await proc.stdout.readline()
         if not line:
             break
         text = line.decode("utf-8", errors="replace").strip()
@@ -449,53 +476,10 @@ async def _read_stderr_loop(proc, session: dict):
                     pass
         elif any(p in lower for p in TWO_FA_PATTERNS):
             session["needs_2fa"] = True
-
-
-# Matches lines that are icloudpd log output rather than actual names.
-# e.g. "2026-04-05 09:29:23 INFO ..." or "2026-04-05 09:29:23 DEBUG ..."
-_LOG_LINE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}\s+(INFO|DEBUG|WARNING|ERROR|CRITICAL)\b")
-
-
-async def _collect_stdout_names(proc) -> list[str]:
-    """Reads stdout line by line; filters out log lines, returns actual names."""
-    names = []
-    while True:
-        line = await proc.stdout.readline()
-        if not line:
-            break
-        text = line.decode("utf-8", errors="replace").strip()
-        if text and not _LOG_LINE_RE.match(text):
+        elif not _LOG_LINE_RE.match(text):
+            # Non-log-header lines that aren't prompts are actual names
             names.append(text)
-    return names
 
-
-async def _run_icloudpd(session: dict, extra_args: list[str]) -> list[str]:
-    """
-    Runs icloudpd with the given extra args.
-    Returns the list of names printed to stdout.
-    Handles 2FA/trust via stderr monitoring.
-    """
-    cmd = [
-        "icloudpd",
-        "--username", session["username"],
-        "--password", session["password"],
-        "--cookie-directory", COOKIE_DIR,
-        "--no-progress-bar",
-    ] + extra_args
-
-    proc = await asyncio.create_subprocess_exec(
-        *cmd,
-        stdin=asyncio.subprocess.PIPE,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,   # keep separate from stdout
-    )
-    session["proc"] = proc
-
-    # Read stderr (logs + 2FA) and stdout (names) concurrently
-    names, _ = await asyncio.gather(
-        _collect_stdout_names(proc),
-        _read_stderr_loop(proc, session),
-    )
     await proc.wait()
     session["proc"] = None
     return names
