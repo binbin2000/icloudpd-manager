@@ -214,7 +214,7 @@ const makeDefaultForm = () => ({
   library: '',                   // SharedSync library name (auto-detected, hidden)
   include_shared_library: false, // when true, sync runs twice (Personal + Shared)
   album: 'All Photos',
-  output_dir: photosDir,
+  output_dir: '/photos',
   shared_output_dir: '',
   organize_by_album: true,
   sync_favorites: false,
