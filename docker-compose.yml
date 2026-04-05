@@ -15,6 +15,12 @@ services:
       - ./photos:/photos
 
     environment:
+      # ── File ownership ──────────────────────────────────────────────────────
+      # Set these to the UID/GID of the host user that should own downloaded files.
+      # Run `id` on your host to find your UID/GID.
+      PUID: 1000
+      PGID: 1000
+
       # Internal path to the SQLite database file
       DB_PATH: /app-data/jobs.db
 

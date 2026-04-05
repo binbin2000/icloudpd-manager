@@ -21,6 +21,7 @@ FROM python:3.12-slim
 # System deps
 RUN apt-get update && apt-get install -y --no-install-recommends \
         curl \
+        gosu \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
@@ -41,6 +42,10 @@ COPY --from=frontend-build /app/backend/static ./static
 # even before docker-compose volumes are attached
 RUN mkdir -p /app-data/cookies /photos
 
+# Copy entrypoint script that handles PUID/PGID remapping
+COPY entrypoint.sh /entrypoint.sh
+RUN chmod +x /entrypoint.sh
+
 # Expose port
 EXPOSE 8000
 
@@ -48,5 +53,5 @@ EXPOSE 8000
 HEALTHCHECK --interval=30s --timeout=10s --start-period=15s \
   CMD curl -f http://localhost:8000/api/stats || exit 1
 
-# Run with uvicorn
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "1"]
+# Entrypoint remaps UID/GID then drops privileges before starting uvicorn
+ENTRYPOINT ["/entrypoint.sh"]
