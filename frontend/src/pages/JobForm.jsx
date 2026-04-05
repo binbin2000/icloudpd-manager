@@ -327,7 +327,7 @@ export default function JobForm() {
   ].filter(Boolean).join('/')
 
   return (
-    <div className="p-8 max-w-2xl mx-auto">
+    <div className="p-4 sm:p-8 max-w-2xl mx-auto">
       <div className="mb-6 flex items-center gap-3">
         <button onClick={() => navigate(-1)} className="btn-secondary btn-sm">
           <ArrowLeft className="w-3 h-3" />
@@ -432,13 +432,13 @@ export default function JobForm() {
           )}
 
           {/* Fetch button */}
-          <div className="flex items-center justify-between">
+          <div className="flex flex-wrap items-center justify-between gap-3">
             <p className="text-xs text-gray-500">
               Fetch albums and detect shared libraries from your iCloud account.
             </p>
             <button
               type="button"
-              className="btn-secondary btn-sm shrink-0 ml-3"
+              className="btn-secondary btn-sm shrink-0"
               onClick={openListingModal}
             >
               <RefreshCw className="w-3 h-3" />
@@ -584,7 +584,7 @@ export default function JobForm() {
             Filter by <strong>photo taken date</strong> (the date the photo was shot, from EXIF).
             Leave blank to sync all available photos.
           </p>
-          <div className="grid grid-cols-2 gap-4">
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
             <div>
               <label className="label">Taken on or after</label>
               <input
