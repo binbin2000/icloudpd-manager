@@ -477,7 +477,13 @@ async def _run_icloudpd(session: dict, extra_args: list[str]) -> list[str]:
         elif any(p in lower for p in TWO_FA_PATTERNS):
             session["needs_2fa"] = True
         elif not _LOG_LINE_RE.match(text):
-            # Non-log-header lines that aren't prompts are actual names
+            # Skip icloudpd section-header lines (e.g. "Albums:", "Libraries:")
+            if text.endswith(":"):
+                continue
+            # Skip smart-album divider lines ("Smart Albums", "Smarta album", …)
+            if "smart" in lower and "album" in lower:
+                continue
+            # Anything else is an actual name (album or library)
             names.append(text)
 
     await proc.wait()
