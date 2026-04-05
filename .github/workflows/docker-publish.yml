@@ -1,0 +1,72 @@
+name: Build and publish Docker image
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - 'v*'          # v1.0, v1.2.3, etc.
+  pull_request:
+    branches:
+      - main          # build (but don't push) on PRs to main
+  workflow_dispatch:  # allow manual runs from the Actions tab
+
+env:
+  REGISTRY: ghcr.io
+  # github.repository = owner/repo, e.g. robin/icloud-sync-app
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write   # needed to push to GHCR
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # Set up QEMU so we can build multi-platform images (arm64 for Raspberry Pi / NAS)
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # Log in to GHCR — skipped on pull_request events (no push needed)
+      - name: Log in to GitHub Container Registry
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Derive image tags and labels from git metadata:
+      #   branch push  → ghcr.io/owner/repo:main  + :sha-<short>
+      #   version tag  → ghcr.io/owner/repo:v1.2.3 + :1.2.3 + :latest
+      #   pull request → ghcr.io/owner/repo:pr-42  (not pushed)
+      - name: Extract Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=ref,event=branch
+            type=ref,event=pr
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=sha,prefix=sha-,format=short
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          # Reuse the GitHub Actions cache between runs to speed up builds
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

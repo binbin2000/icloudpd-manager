@@ -1,0 +1,32 @@
+services:
+  icloud-sync:
+    build: .
+    container_name: icloud-sync
+    restart: unless-stopped
+    ports:
+      - "8080:8000"           # Web UI → http://localhost:8080
+    volumes:
+      # ── Data directory (database + iCloud session cookies) ──────────────────
+      # Change ./data to any path on your host, e.g. /opt/icloud-sync/data
+      - ./data:/app-data
+
+      # ── Photos directory (downloaded photo library) ─────────────────────────
+      # Change ./photos to wherever you want photos stored, e.g. /mnt/nas/icloud
+      - ./photos:/photos
+
+    environment:
+      # Internal path to the SQLite database file
+      DB_PATH: /app-data/jobs.db
+
+      # Internal path where iCloud session cookies are stored
+      COOKIE_DIR: /app-data/cookies
+
+      # Timezone for log timestamps (e.g. Europe/Stockholm, America/New_York, UTC)
+      TZ: Europe/Stockholm
+
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/api/stats"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
