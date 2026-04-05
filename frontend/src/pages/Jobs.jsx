@@ -107,12 +107,12 @@ function JobCard({ job, onDelete, onNeed2FA }) {
 
   return (
     <>
-      <div className="card p-5 flex flex-col gap-3">
+      <div className="card p-4 sm:p-5 flex flex-col gap-3">
         {/* Header */}
         <div className="flex items-start justify-between gap-2">
-          <div>
-            <h3 className="font-semibold text-gray-900 text-base">{job.name}</h3>
-            <p className="text-xs text-gray-400 mt-0.5">{job.username}</p>
+          <div className="min-w-0">
+            <h3 className="font-semibold text-gray-900 text-base truncate">{job.name}</h3>
+            <p className="text-xs text-gray-400 mt-0.5 truncate">{job.username}</p>
           </div>
           <div className="flex items-center gap-1.5 shrink-0 flex-wrap justify-end">
             {isRunning
@@ -130,9 +130,9 @@ function JobCard({ job, onDelete, onNeed2FA }) {
         </div>
 
         {/* Details */}
-        <div className="grid grid-cols-2 gap-x-4 gap-y-1 text-xs text-gray-500">
-          <div><span className="font-medium text-gray-600">Album:</span> {job.album}</div>
-          <div><span className="font-medium text-gray-600">Output:</span> {job.output_dir}</div>
+        <div className="grid grid-cols-1 sm:grid-cols-2 gap-x-4 gap-y-1 text-xs text-gray-500">
+          <div className="truncate"><span className="font-medium text-gray-600">Album:</span> {job.album}</div>
+          <div className="truncate"><span className="font-medium text-gray-600">Output:</span> {job.output_dir}</div>
           <div>
             <span className="font-medium text-gray-600">By album:</span>{' '}
             {job.organize_by_album ? '✓' : '✗'}
@@ -142,20 +142,20 @@ function JobCard({ job, onDelete, onNeed2FA }) {
             {job.organize_by_year ? `✓ (${job.folder_structure})` : '✗'}
           </div>
           {job.schedule_enabled && (
-            <div className="col-span-2">
+            <div className="col-span-full">
               <span className="font-medium text-gray-600">Schedule:</span>{' '}
               <code className="bg-gray-100 px-1 rounded">{job.cron_expression}</code>
             </div>
           )}
           {job.last_run_at && (
-            <div className="col-span-2 text-gray-400">
+            <div className="col-span-full text-gray-400">
               Last run: {formatDistanceToNow(new Date(job.last_run_at), { addSuffix: true })}
             </div>
           )}
         </div>
 
         {/* Actions */}
-        <div className="flex items-center gap-2 pt-1 border-t border-gray-100">
+        <div className="flex flex-wrap items-center gap-2 pt-1 border-t border-gray-100">
           {isRunning ? (
             <button
               className="btn-danger btn-sm"
@@ -214,14 +214,14 @@ export default function Jobs() {
   })
 
   return (
-    <div className="p-8 max-w-5xl mx-auto">
+    <div className="p-4 sm:p-8 max-w-5xl mx-auto">
       {twoFAJob && (
         <TwoFAModal job={twoFAJob} onClose={() => setTwoFAJob(null)} />
       )}
 
-      <div className="mb-6 flex items-center justify-between">
+      <div className="mb-6 flex flex-wrap items-center justify-between gap-3">
         <div>
-          <h1 className="text-2xl font-bold text-gray-900">Sync Jobs</h1>
+          <h1 className="text-xl sm:text-2xl font-bold text-gray-900">Sync Jobs</h1>
           <p className="text-sm text-gray-500 mt-1">Manage and run your iCloud photo sync jobs</p>
         </div>
         <div className="flex gap-2">
@@ -251,7 +251,7 @@ export default function Jobs() {
           </Link>
         </div>
       ) : (
-        <div className="grid gap-4 md:grid-cols-2">
+        <div className="grid gap-4 sm:grid-cols-2">
           {jobs.map(job => (
             <JobCard key={job.id} job={job} onNeed2FA={setTwoFAJob} />
           ))}
