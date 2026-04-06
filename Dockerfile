@@ -27,10 +27,25 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /app
 
-# Install Python dependencies (icloudpd is included in requirements.txt)
+# Install Python dependencies (icloudpd binary wheel for the CLI)
 COPY backend/requirements.txt .
 RUN --mount=type=cache,target=/root/.cache/pip \
     pip install -r requirements.txt
+
+# Extract pyicloud_ipd and foundation from icloudpd source so they are
+# importable as Python packages.  The icloudpd PyPI wheel ships only
+# PyInstaller binaries; the library source must come from git.
+# We clone shallow, copy just the two needed packages, then delete the repo.
+RUN --mount=type=cache,target=/root/.cache/git \
+    git clone --depth=1 --branch icloudpd-1.32.2 \
+        https://github.com/icloud-photos-downloader/icloud_photos_downloader.git \
+        /tmp/icloudpd_src && \
+    cp -r /tmp/icloudpd_src/src/pyicloud_ipd /opt/pyicloud_ipd_src && \
+    cp -r /tmp/icloudpd_src/src/foundation   /opt/pyicloud_ipd_src && \
+    rm -rf /tmp/icloudpd_src
+
+# Add the extracted source to Python's search path
+ENV PYTHONPATH=/opt/pyicloud_ipd_src
 
 # Copy backend source
 COPY backend/ .
