@@ -282,29 +282,21 @@ class ProcessManager:
                 await self._log(run_id, job_id, "info",
                                 f"──── Syncing Shared Library: {shared_lib} ────")
 
-                # When syncing by album, run one SharedSync pass per album so that
-                # photos stored in SharedSync but belonging to a PrimarySync album
-                # are placed in the correct album subfolder (Shared Library/Year/Album/).
-                # icloudpd may return a non-zero exit code for albums that have no
-                # SharedSync photos (album metadata lives in PrimarySync only), so we
-                # treat per-album SharedSync failures as warnings, not hard errors.
+                # In multi-album mode, discover SharedSync photos that belong to
+                # PrimarySync albums using a cross-zone CloudKit query via
+                # pyicloud_ipd.  Albums exist only in PrimarySync; SharedSync has
+                # no user-created albums so icloudpd --album crashes there.
+                # Instead we query the SharedSync zone directly using the
+                # PrimarySync album's parentId filter — iCloud stores cross-library
+                # ContainerRelation records in the photo's zone (SharedSync).
                 if multi_album and albums:
-                    for alb in albums:
-                        if run_id in self.stop_requested:
-                            break
-                        await self._log(run_id, job_id, "info",
-                                        f"──── Syncing Shared Library album: {alb} ────")
-                        rc = await self._run_one_phase(job, run_id, job_id,
-                                                       library=shared_lib,
-                                                       album_override=alb,
-                                                       shared_library_root=True)
-                        if rc != 0:
-                            await self._log(run_id, job_id, "warning",
-                                            f"SharedSync album '{alb}' exited {rc} "
-                                            f"(album may not exist in SharedSync — skipping)")
+                    await self._log(run_id, job_id, "info",
+                                    "Discovering SharedSync photos per album via pyicloud_ipd …")
+                    await self._sync_shared_photos_by_ps_albums(
+                        job, run_id, job_id, albums)
 
-                # Always run a full SharedSync pass to capture photos that are not
-                # in any named album (organised by date only).
+                # Always run a full SharedSync pass to capture photos not in any
+                # named album (organised by date only).
                 if run_id not in self.stop_requested:
                     await self._log(run_id, job_id, "info",
                                     "Syncing all shared photos → Shared Library/ (date organised)")
@@ -329,6 +321,200 @@ class ProcessManager:
             self.processes.pop(run_id, None)
             self.needs_2fa.pop(run_id, None)
             self.stop_requested.discard(run_id)
+
+    # ── Cross-library album sync (pyicloud_ipd) ────────────────────────────
+
+    def _run_shared_album_sync_blocking(
+        self, job: dict, albums: List[str], run_id: str
+    ) -> List[tuple]:
+        """
+        Synchronous worker (runs in a thread executor) that uses pyicloud_ipd
+        to download SharedSync photos belonging to PrimarySync albums.
+
+        Strategy: iCloud stores CPLContainerRelation records for cross-library
+        album membership in the *photo's* zone (SharedSync), tagged with the
+        PrimarySync album's record name as parentId.  We create a PhotoAlbum
+        proxy that points at the SharedSync zone but uses the PrimarySync
+        album's container filter, so the CloudKit query returns exactly the
+        SharedSync photos that are in that album.
+
+        Returns a list of (level, message) tuples for the caller to log.
+        """
+        logs: List[tuple] = []
+
+        shared_lib_name = job.get("library", "")
+        base_dir = self._resolve_output_dir(job)
+        shared_out = (
+            job.get("shared_output_dir") or os.path.join(base_dir, "Shared Library")
+        )
+        raw_fmt = job.get("folder_structure") or "{:%Y}"
+        # Convert icloudpd format ("{:%Y}") to plain strftime format ("%Y")
+        strftime_fmt = re.sub(r"\{:(.*?)\}", r"\1", raw_fmt)
+
+        # ── Import pyicloud_ipd ───────────────────────────────────────────
+        try:
+            from pyicloud_ipd import PyiCloudService          # type: ignore
+            from pyicloud_ipd.services.photos import PhotoAlbum as _PA  # type: ignore
+        except ImportError:
+            logs.append(("warning",
+                         "pyicloud_ipd not importable — shared-album sync skipped"))
+            return logs
+
+        # ── Authenticate (reuses cookies stored by icloudpd) ──────────────
+        try:
+            icloud = PyiCloudService(
+                job["username"],
+                job["password"],
+                cookie_directory=COOKIE_DIR,
+            )
+        except Exception as exc:
+            logs.append(("warning",
+                         f"pyicloud_ipd auth failed: {exc} — shared-album sync skipped"))
+            return logs
+
+        if getattr(icloud, "requires_2fa", False) or getattr(icloud, "requires_2sa", False):
+            logs.append(("warning",
+                         "iCloud 2FA required — shared-album sync skipped"))
+            return logs
+
+        # ── Locate the SharedSync library ─────────────────────────────────
+        shared_libs = getattr(icloud.photos, "shared_libraries", {})
+        shared_svc = shared_libs.get(shared_lib_name)
+        if shared_svc is None:
+            logs.append(("warning",
+                         f"Shared library '{shared_lib_name}' not found — "
+                         "shared-album sync skipped"))
+            return logs
+
+        # ── List PrimarySync albums ───────────────────────────────────────
+        try:
+            ps_albums = icloud.photos.albums
+        except Exception as exc:
+            logs.append(("warning",
+                         f"Cannot list PrimarySync albums: {exc} — "
+                         "shared-album sync skipped"))
+            return logs
+
+        # ── Per-album cross-zone query and download ───────────────────────
+        for alb_name in albums:
+            if run_id in self.stop_requested:
+                break
+
+            ps_album = ps_albums.get(alb_name)
+            if ps_album is None:
+                continue
+
+            # Build the cross-zone PhotoAlbum:
+            #   • connection params come from the SharedSync service (so
+            #     queries hit the SharedSync CloudKit endpoint/zone)
+            #   • list_type / obj_type / query_filter come from the
+            #     PrimarySync album (so the parentId filter is the album's
+            #     folder record name, not a SharedSync container)
+            try:
+                shared_zone_id = getattr(shared_svc, "_zone_id", None)
+                cross_album = _PA(
+                    params=shared_svc.params,
+                    session=shared_svc.session,
+                    service_endpoint=shared_svc.service_endpoint,
+                    name=alb_name,
+                    list_type=ps_album._list_type,
+                    obj_type=ps_album._obj_type,
+                    query_filter=ps_album._query_filter,
+                    zone_id=shared_zone_id,
+                )
+            except Exception as exc:
+                logs.append(("warning",
+                             f"Cannot build cross-zone album '{alb_name}': {exc}"))
+                continue
+
+            safe_album = alb_name.replace("/", "_").replace("\\", "_")
+            downloaded = 0
+
+            try:
+                for photo in cross_album.photos:
+                    if run_id in self.stop_requested:
+                        break
+
+                    # Determine output subdirectory
+                    try:
+                        year_str = photo.created.strftime(strftime_fmt)
+                    except Exception:
+                        year_str = "unknown"
+
+                    if job.get("organize_by_year") and job.get("organize_by_album"):
+                        sub = os.path.join(shared_out, year_str, safe_album)
+                    elif job.get("organize_by_year"):
+                        sub = os.path.join(shared_out, year_str)
+                    elif job.get("organize_by_album"):
+                        sub = os.path.join(shared_out, safe_album)
+                    else:
+                        sub = shared_out
+
+                    os.makedirs(sub, exist_ok=True)
+                    target = os.path.join(sub, photo.filename)
+
+                    if os.path.exists(target):
+                        continue
+
+                    # Download via the authenticated session
+                    try:
+                        versions = getattr(photo, "versions", {})
+                        # Pick the original version; fall back to any version
+                        version_obj = None
+                        for _key, _ver in versions.items():
+                            if "original" in str(_key).lower():
+                                version_obj = _ver
+                                break
+                        if version_obj is None and versions:
+                            version_obj = next(iter(versions.values()))
+                        if version_obj is None:
+                            continue
+
+                        url = getattr(version_obj, "url", None)
+                        if not url:
+                            continue
+
+                        resp = shared_svc.session.get(url, stream=True)
+                        resp.raise_for_status()
+                        with open(target, "wb") as f:
+                            for chunk in resp.iter_content(chunk_size=8192):
+                                if chunk:
+                                    f.write(chunk)
+                        downloaded += 1
+
+                    except Exception as dl_exc:
+                        logs.append(("warning",
+                                     f"Failed to download '{photo.filename}': {dl_exc}"))
+
+            except Exception as exc:
+                logs.append(("warning",
+                             f"Error iterating cross-zone album '{alb_name}': {exc}"))
+                continue
+
+            if downloaded > 0:
+                logs.append(("info",
+                             f"Downloaded {downloaded} SharedSync photo(s) "
+                             f"for album '{alb_name}'"))
+
+        return logs
+
+    async def _sync_shared_photos_by_ps_albums(
+        self, job: dict, run_id: str, job_id: int, albums: List[str]
+    ) -> None:
+        """
+        Async wrapper: runs _run_shared_album_sync_blocking in a thread
+        executor so it does not block the event loop, then logs all messages.
+        """
+        if not albums or not job.get("library"):
+            return
+        loop = asyncio.get_event_loop()
+        logs: List[tuple] = await loop.run_in_executor(
+            None,
+            self._run_shared_album_sync_blocking,
+            job, albums, run_id,
+        )
+        for level, msg in logs:
+            await self._log(run_id, job_id, level, msg)
 
     def _resolve_output_dir(self, job: dict) -> str:
         # Always use the base output directory.
