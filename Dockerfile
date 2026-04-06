@@ -31,18 +31,10 @@ COPY backend/requirements.txt .
 RUN --mount=type=cache,target=/root/.cache/pip \
     pip install -r requirements.txt
 
-# Extract pyicloud_ipd and foundation from icloudpd source so they are
-# importable as Python packages.  The icloudpd PyPI wheel ships only
-# PyInstaller binaries; the library source is not otherwise accessible.
-# We download the GitHub release tarball via curl (no git needed) and
-# unpack only the two packages we need.
-RUN mkdir -p /opt/pyicloud_ipd_src && \
-    curl -fsSL \
-        "https://github.com/icloud-photos-downloader/icloud_photos_downloader/archive/refs/tags/icloudpd-1.32.2.tar.gz" \
-    | tar xz --strip-components=2 \
-        -C /opt/pyicloud_ipd_src \
-        "icloud_photos_downloader-icloudpd-1.32.2/src/pyicloud_ipd" \
-        "icloud_photos_downloader-icloudpd-1.32.2/src/foundation"
+# pyicloud_ipd and foundation are vendored from icloudpd v1.32.2 source.
+# The icloudpd PyPI wheel ships only PyInstaller binaries so the library
+# source is not otherwise accessible as an importable Python package.
+COPY backend/vendor /opt/pyicloud_ipd_src
 
 # Add the extracted source to Python's search path
 ENV PYTHONPATH=/opt/pyicloud_ipd_src
