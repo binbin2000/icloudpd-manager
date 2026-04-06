@@ -352,66 +352,14 @@ class ProcessManager:
         strftime_fmt = re.sub(r"\{:(.*?)\}", r"\1", raw_fmt)
 
         # ── Import pyicloud_ipd ───────────────────────────────────────────
-        # pyicloud_ipd is bundled inside the icloudpd wheel.  On some Docker
-        # builds its install location isn't on sys.path, so we locate it via
-        # the distribution RECORD and add the path manually before importing.
-        import importlib as _il
-        import importlib.metadata as _imeta
-        import importlib.util as _ilu
-        import sys as _sys
-
-        def _locate_pyicloud_in_dist() -> str | None:
-            """Return the directory containing pyicloud_ipd/, or None."""
-            try:
-                dist = _imeta.distribution("icloudpd")
-                for f in (dist.files or []):
-                    s = str(f)
-                    if "pyicloud_ipd/__init__" in s or "pyicloud_ipd\\__init__" in s:
-                        abs_path = dist.locate_file(f)
-                        # abs_path is .../site-packages/pyicloud_ipd/__init__.py
-                        return str(abs_path.parent.parent)
-            except Exception:
-                pass
-            return None
-
-        # 1) Try direct import
-        _import_ok = False
         try:
             from pyicloud_ipd import PyiCloudService          # type: ignore
             from pyicloud_ipd.services.photos import PhotoAlbum as _PA  # type: ignore
-            _import_ok = True
-        except ModuleNotFoundError:
-            pass
-
-        # 2) Locate via distribution metadata, patch sys.path, retry
-        if not _import_ok:
-            _parent = _locate_pyicloud_in_dist()
-            if _parent and _parent not in _sys.path:
-                _sys.path.insert(0, _parent)
-            try:
-                from pyicloud_ipd import PyiCloudService          # type: ignore
-                from pyicloud_ipd.services.photos import PhotoAlbum as _PA  # type: ignore
-                _import_ok = True
-                logs.append(("info",
-                              f"pyicloud_ipd imported after adding {_parent} to sys.path"))
-            except Exception as _exc2:
-                # Collect diagnostics
-                try:
-                    _ver = _imeta.version("icloudpd")
-                except Exception:
-                    _ver = "unknown"
-                try:
-                    _dist2 = _imeta.distribution("icloudpd")
-                    _pi_files = [str(f) for f in (_dist2.files or [])
-                                 if "pyicloud_ipd" in str(f)][:8]
-                except Exception:
-                    _pi_files = ["(could not read dist files)"]
-                logs.append(("warning",
-                             f"pyicloud_ipd import failed ({type(_exc2).__name__}: {_exc2}); "
-                             f"icloudpd={_ver}; "
-                             f"dist pyicloud_ipd files={_pi_files}; "
-                             f"path_added={_parent}"))
-                return logs
+        except Exception as exc:
+            logs.append(("warning",
+                         f"pyicloud_ipd unavailable ({type(exc).__name__}: {exc}) — "
+                         "shared-album sync skipped"))
+            return logs
 
         # ── Authenticate (reuses cookies stored by icloudpd) ──────────────
         try:

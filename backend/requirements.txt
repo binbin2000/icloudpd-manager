@@ -6,4 +6,8 @@ aiofiles==23.2.1
 python-multipart==0.0.9
 pydantic==2.7.1
 croniter==2.0.5
-icloudpd==1.32.2
+# Install from git source so pyicloud_ipd is available as an importable Python package.
+# The PyPI wheel ships only PyInstaller binaries; pyicloud_ipd is compiled into them
+# and cannot be imported. Source install gives us icloudpd + pyicloud_ipd + foundation
+# as regular Python packages with the same code as the 1.32.2 release.
+icloudpd @ git+https://github.com/icloud-photos-downloader/icloud_photos_downloader.git@icloudpd-1.32.2
