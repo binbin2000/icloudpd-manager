@@ -6,4 +6,4 @@ aiofiles==23.2.1
 python-multipart==0.0.9
 pydantic==2.7.1
 croniter==2.0.5
-icloudpd
+icloudpd==1.32.2

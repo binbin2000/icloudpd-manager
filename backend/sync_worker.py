@@ -356,9 +356,21 @@ class ProcessManager:
             from pyicloud_ipd import PyiCloudService          # type: ignore
             from pyicloud_ipd.services.photos import PhotoAlbum as _PA  # type: ignore
         except Exception as exc:
+            try:
+                import importlib.metadata as _meta
+                _icloudpd_ver = _meta.version("icloudpd")
+            except Exception:
+                _icloudpd_ver = "unknown"
+            try:
+                import importlib.util as _ilu
+                _spec = _ilu.find_spec("pyicloud_ipd")
+                _spec_info = str(_spec) if _spec else "not found in sys.path"
+            except Exception:
+                _spec_info = "find_spec failed"
             logs.append(("warning",
-                         f"pyicloud_ipd import failed ({type(exc).__name__}: {exc}) — "
-                         "shared-album sync skipped"))
+                         f"pyicloud_ipd import failed ({type(exc).__name__}: {exc}); "
+                         f"icloudpd={_icloudpd_ver} spec={_spec_info} — "
+                         "rebuild the Docker image to reinstall icloudpd==1.32.2"))
             return logs
 
         # ── Authenticate (reuses cookies stored by icloudpd) ──────────────
