@@ -21,7 +21,6 @@ FROM python:3.12-slim
 # System deps
 RUN apt-get update && apt-get install -y --no-install-recommends \
         curl \
-        git \
         gosu \
     && rm -rf /var/lib/apt/lists/*
 
@@ -34,15 +33,16 @@ RUN --mount=type=cache,target=/root/.cache/pip \
 
 # Extract pyicloud_ipd and foundation from icloudpd source so they are
 # importable as Python packages.  The icloudpd PyPI wheel ships only
-# PyInstaller binaries; the library source must come from git.
-# We clone shallow, copy just the two needed packages, then delete the repo.
-RUN --mount=type=cache,target=/root/.cache/git \
-    git clone --depth=1 --branch icloudpd-1.32.2 \
-        https://github.com/icloud-photos-downloader/icloud_photos_downloader.git \
-        /tmp/icloudpd_src && \
-    cp -r /tmp/icloudpd_src/src/pyicloud_ipd /opt/pyicloud_ipd_src && \
-    cp -r /tmp/icloudpd_src/src/foundation   /opt/pyicloud_ipd_src && \
-    rm -rf /tmp/icloudpd_src
+# PyInstaller binaries; the library source is not otherwise accessible.
+# We download the GitHub release tarball via curl (no git needed) and
+# unpack only the two packages we need.
+RUN mkdir -p /opt/pyicloud_ipd_src && \
+    curl -fsSL \
+        "https://github.com/icloud-photos-downloader/icloud_photos_downloader/archive/refs/tags/icloudpd-1.32.2.tar.gz" \
+    | tar xz --strip-components=2 \
+        -C /opt/pyicloud_ipd_src \
+        "icloud_photos_downloader-icloudpd-1.32.2/src/pyicloud_ipd" \
+        "icloud_photos_downloader-icloudpd-1.32.2/src/foundation"
 
 # Add the extracted source to Python's search path
 ENV PYTHONPATH=/opt/pyicloud_ipd_src
