@@ -282,21 +282,38 @@ class ProcessManager:
                 await self._log(run_id, job_id, "info",
                                 f"──── Syncing Shared Library: {shared_lib} ────")
 
-                # icloudpd does not support album filtering on SharedSync —
-                # passing --album with --library SharedSync-… always crashes with
-                # a KeyError because album metadata lives in PrimarySync only.
-                # We therefore sync all shared photos in a single pass, placing
-                # them in a "Shared Library" subfolder organised by date.
-                # Photos that are shared AND in named albums are already written
-                # to the correct album folder by the PrimarySync phase above.
-                await self._log(run_id, job_id, "info",
-                                "Syncing all shared photos → Shared Library/ (date organised)")
-                rc = await self._run_one_phase(job, run_id, job_id,
-                                               library=shared_lib,
-                                               album_override="All Photos",
-                                               shared_library_root=True)
-                if rc != 0:
-                    final_status = "error"
+                # When syncing by album, run one SharedSync pass per album so that
+                # photos stored in SharedSync but belonging to a PrimarySync album
+                # are placed in the correct album subfolder (Shared Library/Year/Album/).
+                # icloudpd may return a non-zero exit code for albums that have no
+                # SharedSync photos (album metadata lives in PrimarySync only), so we
+                # treat per-album SharedSync failures as warnings, not hard errors.
+                if multi_album and albums:
+                    for alb in albums:
+                        if run_id in self.stop_requested:
+                            break
+                        await self._log(run_id, job_id, "info",
+                                        f"──── Syncing Shared Library album: {alb} ────")
+                        rc = await self._run_one_phase(job, run_id, job_id,
+                                                       library=shared_lib,
+                                                       album_override=alb,
+                                                       shared_library_root=True)
+                        if rc != 0:
+                            await self._log(run_id, job_id, "warning",
+                                            f"SharedSync album '{alb}' exited {rc} "
+                                            f"(album may not exist in SharedSync — skipping)")
+
+                # Always run a full SharedSync pass to capture photos that are not
+                # in any named album (organised by date only).
+                if run_id not in self.stop_requested:
+                    await self._log(run_id, job_id, "info",
+                                    "Syncing all shared photos → Shared Library/ (date organised)")
+                    rc = await self._run_one_phase(job, run_id, job_id,
+                                                   library=shared_lib,
+                                                   album_override="All Photos",
+                                                   shared_library_root=True)
+                    if rc != 0:
+                        final_status = "error"
 
         except Exception as e:
             await self._log(run_id, job_id, "error", f"Sync error: {e}")
