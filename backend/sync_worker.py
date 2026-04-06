@@ -355,9 +355,10 @@ class ProcessManager:
         try:
             from pyicloud_ipd import PyiCloudService          # type: ignore
             from pyicloud_ipd.services.photos import PhotoAlbum as _PA  # type: ignore
-        except ImportError:
+        except Exception as exc:
             logs.append(("warning",
-                         "pyicloud_ipd not importable — shared-album sync skipped"))
+                         f"pyicloud_ipd import failed ({type(exc).__name__}: {exc}) — "
+                         "shared-album sync skipped"))
             return logs
 
         # ── Authenticate (reuses cookies stored by icloudpd) ──────────────
