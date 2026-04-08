@@ -362,10 +362,14 @@ class ProcessManager:
             return logs
 
         # ── Authenticate (reuses cookies stored by icloudpd) ──────────────
+        # v1.32.2 API: PyiCloudService(domain, apple_id, password_provider, ...)
+        # password_provider must be a callable returning the password string.
         try:
+            _password = job["password"]
             icloud = PyiCloudService(
+                job.get("domain", "com"),
                 job["username"],
-                job["password"],
+                lambda: _password,
                 cookie_directory=COOKIE_DIR,
             )
         except Exception as exc:
@@ -412,16 +416,17 @@ class ProcessManager:
             #     PrimarySync album (so the parentId filter is the album's
             #     folder record name, not a SharedSync container)
             try:
-                shared_zone_id = getattr(shared_svc, "_zone_id", None)
+                # v1.32.2: attributes are list_type / obj_type / query_filter
+                # (no leading underscore); zone_id (not _zone_id) on PhotoLibrary
                 cross_album = _PA(
                     params=shared_svc.params,
                     session=shared_svc.session,
                     service_endpoint=shared_svc.service_endpoint,
                     name=alb_name,
-                    list_type=ps_album._list_type,
-                    obj_type=ps_album._obj_type,
-                    query_filter=ps_album._query_filter,
-                    zone_id=shared_zone_id,
+                    list_type=ps_album.list_type,
+                    obj_type=ps_album.obj_type,
+                    query_filter=ps_album.query_filter,
+                    zone_id=shared_svc.zone_id,
                 )
             except Exception as exc:
                 logs.append(("warning",
