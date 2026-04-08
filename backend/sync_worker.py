@@ -438,44 +438,84 @@ class ProcessManager:
 
         logs.append(("info", f"SharedSync PhotoLibrary created OK"))
 
-        # ── List PrimarySync albums ───────────────────────────────────────
-        try:
-            ps_albums = icloud.photos.albums
-        except Exception as exc:
-            logs.append(("warning",
-                         f"Cannot list PrimarySync albums: {exc} — "
-                         "shared-album sync skipped"))
-            return logs
+        # ── List PrimarySync albums via direct CloudKit query ─────────────
+        # icloud.photos.albums only returns Smart Albums because _fetch_folders
+        # returns zero user-album records from the CPLAlbumByPositionLive query
+        # (probably a zone-ID or params mismatch vs. what the binary uses).
+        # Instead, query the private endpoint directly and decode album names.
+        import base64 as _b64, urllib.parse as _up, json as _json
+        _ps_ep = icloud.photos.get_service_endpoint("private")
+        _ps_zone = {"zoneName": "PrimarySync"}
+        # Also try with the full zone ID returned by zones/list (includes ownerRecordName)
+        for _pz in _private_zones:
+            if _pz["zoneID"]["zoneName"] == "PrimarySync":
+                _ps_zone = _pz["zoneID"]
+                break
+        logs.append(("info", f"PrimarySync zone ID: {_ps_zone}"))
 
+        _folder_records: list = []
+        try:
+            _url = f"{_ps_ep}/records/query?{_up.urlencode(icloud.photos.params)}"
+            _body = _json.dumps({"query": {"recordType": "CPLAlbumByPositionLive"},
+                                 "zoneID": _ps_zone})
+            _r = icloud.photos.session.post(_url, data=_body,
+                                            headers={"Content-type": "text/plain"})
+            _folder_records = _r.json().get("records", [])
+            logs.append(("info", f"CPLAlbumByPositionLive returned {len(_folder_records)} records"))
+        except Exception as _fe:
+            logs.append(("warning", f"CPLAlbumByPositionLive query failed: {_fe}"))
+
+        # Build name→record_name map for user albums
+        _album_record_map: dict = {}  # album_name → folder_record_name
+        for _rec in _folder_records:
+            _rn = _rec.get("recordName", "")
+            if _rn in ("----Root-Folder----", "----Project-Root-Folder----"):
+                continue
+            if _rec.get("fields", {}).get("isDeleted", {}).get("value"):
+                continue
+            _enc = _rec.get("fields", {}).get("albumNameEnc", {}).get("value", "")
+            if _enc:
+                try:
+                    _aname = _b64.b64decode(_enc).decode("utf-8")
+                    _album_record_map[_aname] = _rn
+                except Exception:
+                    pass
         logs.append(("info",
-                     f"Looking for albums {albums} in ps_albums keys={list(ps_albums.keys())[:10]}"))
+                     f"User albums found: {list(_album_record_map.keys())[:10]}"))
 
         # ── Per-album cross-zone query and download ───────────────────────
         for alb_name in albums:
             if run_id in self.stop_requested:
                 break
 
-            ps_album = ps_albums.get(alb_name)
-            if ps_album is None:
+            folder_record_name = _album_record_map.get(alb_name)
+            if folder_record_name is None:
                 continue
 
-            # Build the cross-zone PhotoAlbum:
-            #   • connection params come from the SharedSync service (so
+            # Build the cross-zone PhotoAlbum using the SharedSync zone but
+            # the PrimarySync album's parentId filter.  The obj_type encodes
+            # the folder record name; query_filter narrows to that parentId.
+            _obj_type = f"CPLContainerRelationNotDeletedByAssetDate:{folder_record_name}"
+            _list_type = "CPLContainerRelationLiveByAssetDate"
+            _query_filter = [
+                {
+                    "fieldName": "parentId",
+                    "comparator": "EQUALS",
+                    "fieldValue": {"type": "STRING", "value": folder_record_name},
+                }
+            ]
             #     queries hit the SharedSync CloudKit endpoint/zone)
-            #   • list_type / obj_type / query_filter come from the
-            #     PrimarySync album (so the parentId filter is the album's
-            #     folder record name, not a SharedSync container)
+            #   • list_type / obj_type / query_filter built from the PrimarySync
+            #     album's record name (folder_record_name)
             try:
-                # v1.32.2: attributes are list_type / obj_type / query_filter
-                # (no leading underscore); zone_id (not _zone_id) on PhotoLibrary
                 cross_album = _PA(
                     params=shared_svc.params,
                     session=shared_svc.session,
                     service_endpoint=shared_svc.service_endpoint,
                     name=alb_name,
-                    list_type=ps_album.list_type,
-                    obj_type=ps_album.obj_type,
-                    query_filter=ps_album.query_filter,
+                    list_type=_list_type,
+                    obj_type=_obj_type,
+                    query_filter=_query_filter,
                     zone_id=shared_svc.zone_id,
                 )
             except Exception as exc:
