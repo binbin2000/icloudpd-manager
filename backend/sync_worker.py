@@ -504,6 +504,43 @@ class ProcessManager:
                     "fieldValue": {"type": "STRING", "value": folder_record_name},
                 }
             ]
+
+            # ── Diagnostic: query both zones to find where relations live ──
+            # Only do this for the first album to avoid flooding logs.
+            if albums.index(alb_name) == 0:
+                for _diag_label, _diag_ep, _diag_zone in [
+                    ("SharedSync", shared_svc.service_endpoint, shared_svc.zone_id),
+                    ("PrimarySync", icloud.photos.get_service_endpoint("private"), _ps_zone),
+                ]:
+                    try:
+                        _diag_url = f"{_diag_ep}/records/query?{_up.urlencode(icloud.photos.params)}"
+                        _diag_body = _json.dumps({
+                            "query": {
+                                "filterBy": [
+                                    {"fieldName": "startRank",
+                                     "fieldValue": {"type": "INT64", "value": 0},
+                                     "comparator": "EQUALS"},
+                                    {"fieldName": "direction",
+                                     "fieldValue": {"type": "STRING", "value": "ASCENDING"},
+                                     "comparator": "EQUALS"},
+                                    {"fieldName": "parentId",
+                                     "comparator": "EQUALS",
+                                     "fieldValue": {"type": "STRING", "value": folder_record_name}},
+                                ],
+                                "recordType": _list_type,
+                            },
+                            "resultsLimit": 10,
+                            "zoneID": _diag_zone,
+                        })
+                        _diag_r = icloud.photos.session.post(
+                            _diag_url, data=_diag_body,
+                            headers={"Content-type": "text/plain"})
+                        _diag_recs = _diag_r.json().get("records", [])
+                        logs.append(("info",
+                                     f"[{alb_name}] {_diag_label} zone → "
+                                     f"{len(_diag_recs)} relation records"))
+                    except Exception as _de:
+                        logs.append(("info", f"[{alb_name}] {_diag_label} diag error: {_de}"))
             #     queries hit the SharedSync CloudKit endpoint/zone)
             #   • list_type / obj_type / query_filter built from the PrimarySync
             #     album's record name (folder_record_name)
