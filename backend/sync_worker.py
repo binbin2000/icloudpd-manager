@@ -383,34 +383,57 @@ class ProcessManager:
             return logs
 
         # ── Locate the SharedSync library ─────────────────────────────────
-        # _fetch_libraries() catches all exceptions internally and returns {}.
-        # Query the zones/list endpoint directly first so we can log what the
-        # API actually returns, then fall back to the cached property.
-        try:
-            _svc_endpoint = icloud.photos.get_service_endpoint("shared")
-            _resp = icloud.photos.session.post(
-                f"{_svc_endpoint}/zones/list",
-                data="{}",
-                headers={"Content-type": "text/plain"},
-            )
-            _zones_raw = _resp.json()
-            _zone_names = [
-                z["zoneID"]["zoneName"]
-                for z in _zones_raw.get("zones", [])
-                if not z.get("deleted")
-            ]
-            logs.append(("info", f"Shared zones from API: {_zone_names}"))
-        except Exception as _ze:
-            logs.append(("warning", f"zones/list query failed: {_ze}"))
-            _zone_names = []
+        # SharedSync zones live in the *private* CloudKit database (not the
+        # "shared" database), so shared_libraries() which queries
+        # /production/shared comes back empty.  Query both databases and use
+        # the one that contains the expected zone name.
+        def _query_zones(library_type: str) -> list:
+            try:
+                ep = icloud.photos.get_service_endpoint(library_type)
+                r = icloud.photos.session.post(
+                    f"{ep}/zones/list", data="{}",
+                    headers={"Content-type": "text/plain"})
+                return r.json().get("zones", [])
+            except Exception as _e:
+                logs.append(("info", f"zones/list({library_type}) error: {_e}"))
+                return []
 
-        shared_libs = getattr(icloud.photos, "shared_libraries", {})
-        shared_svc = shared_libs.get(shared_lib_name)
+        _private_zones = _query_zones("private")
+        _shared_zones  = _query_zones("shared")
+        _all_zone_names = [
+            (z["zoneID"]["zoneName"], lib)
+            for lib, zones in (("private", _private_zones), ("shared", _shared_zones))
+            for z in zones if not z.get("deleted")
+        ]
+        logs.append(("info", f"All non-deleted zones: {_all_zone_names}"))
+
+        # Build PhotoLibrary directly from whichever database holds the zone
+        shared_svc = None
+        from pyicloud_ipd.services.photos import PhotoLibrary as _PL  # type: ignore
+        for _lib_type, _zones in (("private", _private_zones), ("shared", _shared_zones)):
+            for _z in _zones:
+                if _z.get("deleted"):
+                    continue
+                if _z["zoneID"]["zoneName"] == shared_lib_name:
+                    try:
+                        shared_svc = _PL(
+                            icloud.photos.get_service_endpoint(_lib_type),
+                            icloud.photos.params,
+                            icloud.photos.session,
+                            zone_id=_z["zoneID"],
+                            library_type=_lib_type,
+                        )
+                    except Exception as _ple:
+                        logs.append(("warning",
+                                     f"PhotoLibrary init for {shared_lib_name} failed: {_ple}"))
+                    break
+            if shared_svc is not None:
+                break
+
         if shared_svc is None:
             logs.append(("warning",
-                         f"Shared library '{shared_lib_name}' not found. "
-                         f"shared_libraries keys={list(shared_libs.keys())} "
-                         f"raw zones={_zone_names} — shared-album sync skipped"))
+                         f"Shared library '{shared_lib_name}' not found in any zone. "
+                         f"Available: {_all_zone_names} — shared-album sync skipped"))
             return logs
 
         # ── List PrimarySync albums ───────────────────────────────────────
