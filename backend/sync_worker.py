@@ -383,12 +383,34 @@ class ProcessManager:
             return logs
 
         # ── Locate the SharedSync library ─────────────────────────────────
+        # _fetch_libraries() catches all exceptions internally and returns {}.
+        # Query the zones/list endpoint directly first so we can log what the
+        # API actually returns, then fall back to the cached property.
+        try:
+            _svc_endpoint = icloud.photos.get_service_endpoint("shared")
+            _resp = icloud.photos.session.post(
+                f"{_svc_endpoint}/zones/list",
+                data="{}",
+                headers={"Content-type": "text/plain"},
+            )
+            _zones_raw = _resp.json()
+            _zone_names = [
+                z["zoneID"]["zoneName"]
+                for z in _zones_raw.get("zones", [])
+                if not z.get("deleted")
+            ]
+            logs.append(("info", f"Shared zones from API: {_zone_names}"))
+        except Exception as _ze:
+            logs.append(("warning", f"zones/list query failed: {_ze}"))
+            _zone_names = []
+
         shared_libs = getattr(icloud.photos, "shared_libraries", {})
         shared_svc = shared_libs.get(shared_lib_name)
         if shared_svc is None:
             logs.append(("warning",
-                         f"Shared library '{shared_lib_name}' not found — "
-                         "shared-album sync skipped"))
+                         f"Shared library '{shared_lib_name}' not found. "
+                         f"shared_libraries keys={list(shared_libs.keys())} "
+                         f"raw zones={_zone_names} — shared-album sync skipped"))
             return logs
 
         # ── List PrimarySync albums ───────────────────────────────────────
