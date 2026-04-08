@@ -436,6 +436,8 @@ class ProcessManager:
                          f"Available: {_all_zone_names} — shared-album sync skipped"))
             return logs
 
+        logs.append(("info", f"SharedSync PhotoLibrary created OK"))
+
         # ── List PrimarySync albums ───────────────────────────────────────
         try:
             ps_albums = icloud.photos.albums
@@ -444,6 +446,9 @@ class ProcessManager:
                          f"Cannot list PrimarySync albums: {exc} — "
                          "shared-album sync skipped"))
             return logs
+
+        logs.append(("info",
+                     f"Looking for albums {albums} in ps_albums keys={list(ps_albums.keys())[:10]}"))
 
         # ── Per-album cross-zone query and download ───────────────────────
         for alb_name in albums:
