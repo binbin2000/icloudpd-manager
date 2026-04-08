@@ -15,7 +15,15 @@ from tzlocal import get_localzone
 from foundation import bytes_decode, wrap_param_in_exception
 from foundation.core import compose, identity
 from foundation.core.optional import fromMaybe
-from icloudpd.paths import clean_filename
+# Inlined from icloudpd v1.32.2 src/icloudpd/paths.py to avoid shadowing
+# the icloudpd CLI package with a shim.
+def clean_filename(filename: str) -> str:
+    """Replaces invalid chars in filenames with '_'"""
+    invalid = '<>:"/\\|?*\0'
+    result = filename
+    for char in invalid:
+        result = result.replace(char, "_")
+    return result
 from pyicloud_ipd.asset_version import (
     ITEM_TYPE_EXTENSIONS,
     AssetVersion,
