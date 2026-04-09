@@ -354,7 +354,6 @@ class ProcessManager:
         # ── Import pyicloud_ipd ───────────────────────────────────────────
         try:
             from pyicloud_ipd import PyiCloudService          # type: ignore
-            from pyicloud_ipd.services.photos import PhotoAlbum as _PA  # type: ignore
         except Exception as exc:
             logs.append(("warning",
                          f"pyicloud_ipd unavailable ({type(exc).__name__}: {exc}) — "
@@ -483,7 +482,16 @@ class ProcessManager:
         logs.append(("info",
                      f"User albums found: {list(_album_record_map.keys())[:10]}"))
 
-        # ── Per-album cross-zone query and download ───────────────────────
+        # ── Per-album: find SharedSync photos that belong to PrimarySync albums ──
+        #
+        # Albums and CPLContainerRelation membership records always live in
+        # PrimarySync zone.  Each relation record has an assetId field that
+        # references a CPLMaster record — which may live in either PrimarySync
+        # or SharedSync zone.  We query PrimarySync for the relation records,
+        # extract assetIds, then look up those IDs in the SharedSync zone to
+        # identify the cross-zone photos and download them.
+        from pyicloud_ipd.services.photos import PhotoAsset as _PAsset  # type: ignore
+
         for alb_name in albums:
             if run_id in self.stop_requested:
                 break
@@ -492,137 +500,179 @@ class ProcessManager:
             if folder_record_name is None:
                 continue
 
-            # Build the cross-zone PhotoAlbum using the SharedSync zone but
-            # the PrimarySync album's parentId filter.  The obj_type encodes
-            # the folder record name; query_filter narrows to that parentId.
-            _obj_type = f"CPLContainerRelationNotDeletedByAssetDate:{folder_record_name}"
-            _list_type = "CPLContainerRelationLiveByAssetDate"
-            _query_filter = [
-                {
-                    "fieldName": "parentId",
-                    "comparator": "EQUALS",
-                    "fieldValue": {"type": "STRING", "value": folder_record_name},
-                }
-            ]
-
-            # ── Diagnostic: query both zones to find where relations live ──
-            # Only do this for the first album to avoid flooding logs.
-            if albums.index(alb_name) == 0:
-                for _diag_label, _diag_ep, _diag_zone in [
-                    ("SharedSync", shared_svc.service_endpoint, shared_svc.zone_id),
-                    ("PrimarySync", icloud.photos.get_service_endpoint("private"), _ps_zone),
-                ]:
-                    try:
-                        _diag_url = f"{_diag_ep}/records/query?{_up.urlencode(icloud.photos.params)}"
-                        _diag_body = _json.dumps({
-                            "query": {
-                                "filterBy": [
-                                    {"fieldName": "startRank",
-                                     "fieldValue": {"type": "INT64", "value": 0},
-                                     "comparator": "EQUALS"},
-                                    {"fieldName": "direction",
-                                     "fieldValue": {"type": "STRING", "value": "ASCENDING"},
-                                     "comparator": "EQUALS"},
-                                    {"fieldName": "parentId",
-                                     "comparator": "EQUALS",
-                                     "fieldValue": {"type": "STRING", "value": folder_record_name}},
-                                ],
-                                "recordType": _list_type,
-                            },
-                            "resultsLimit": 10,
-                            "zoneID": _diag_zone,
-                        })
-                        _diag_r = icloud.photos.session.post(
-                            _diag_url, data=_diag_body,
-                            headers={"Content-type": "text/plain"})
-                        _diag_recs = _diag_r.json().get("records", [])
-                        logs.append(("info",
-                                     f"[{alb_name}] {_diag_label} zone → "
-                                     f"{len(_diag_recs)} relation records"))
-                    except Exception as _de:
-                        logs.append(("info", f"[{alb_name}] {_diag_label} diag error: {_de}"))
-            #     queries hit the SharedSync CloudKit endpoint/zone)
-            #   • list_type / obj_type / query_filter built from the PrimarySync
-            #     album's record name (folder_record_name)
-            try:
-                cross_album = _PA(
-                    params=shared_svc.params,
-                    session=shared_svc.session,
-                    service_endpoint=shared_svc.service_endpoint,
-                    name=alb_name,
-                    list_type=_list_type,
-                    obj_type=_obj_type,
-                    query_filter=_query_filter,
-                    zone_id=shared_svc.zone_id,
-                )
-            except Exception as exc:
-                logs.append(("warning",
-                             f"Cannot build cross-zone album '{alb_name}': {exc}"))
-                continue
-
             safe_album = alb_name.replace("/", "_").replace("\\", "_")
             downloaded = 0
 
-            try:
-                for photo in cross_album.photos:
-                    if run_id in self.stop_requested:
-                        break
+            # ── Step 1: collect assetIds from PrimarySync relation records ──
+            # Page through CPLContainerRelationLiveByAssetDate in PrimarySync.
+            # Each page uses startRank = number of items seen so far (item
+            # count, not raw record count, since CPLAsset sibling records also
+            # appear when CloudKit expands the junction into CPLMaster+CPLAsset
+            # pairs).  We stop when we receive fewer records than the limit.
+            _asset_ids: list = []
+            _offset = 0
+            _page_size = 500
+            while True:
+                _rel_url = (f"{_ps_ep}/records/query?"
+                            f"{_up.urlencode(icloud.photos.params)}")
+                _rel_body = _json.dumps({
+                    "query": {
+                        "filterBy": [
+                            {"fieldName": "startRank",
+                             "fieldValue": {"type": "INT64", "value": _offset},
+                             "comparator": "EQUALS"},
+                            {"fieldName": "direction",
+                             "fieldValue": {"type": "STRING", "value": "ASCENDING"},
+                             "comparator": "EQUALS"},
+                            {"fieldName": "parentId",
+                             "comparator": "EQUALS",
+                             "fieldValue": {"type": "STRING",
+                                            "value": folder_record_name}},
+                        ],
+                        "recordType": "CPLContainerRelationLiveByAssetDate",
+                    },
+                    "resultsLimit": _page_size,
+                    "zoneID": _ps_zone,
+                })
+                try:
+                    _rel_r = icloud.photos.session.post(
+                        _rel_url, data=_rel_body,
+                        headers={"Content-type": "text/plain"})
+                    _page_recs = _rel_r.json().get("records", [])
+                except Exception as _re:
+                    logs.append(("warning",
+                                 f"Album '{alb_name}' relation query failed: {_re}"))
+                    break
 
-                    # Determine output subdirectory
-                    try:
-                        year_str = photo.created.strftime(strftime_fmt)
-                    except Exception:
-                        year_str = "unknown"
-
-                    if job.get("organize_by_year") and job.get("organize_by_album"):
-                        sub = os.path.join(shared_out, year_str, safe_album)
-                    elif job.get("organize_by_year"):
-                        sub = os.path.join(shared_out, year_str)
-                    elif job.get("organize_by_album"):
-                        sub = os.path.join(shared_out, safe_album)
+                _items_this_page = 0
+                for _rr in _page_recs:
+                    _rt = _rr.get("recordType", "")
+                    if _rt == "CPLMaster":
+                        # CloudKit expanded junction → CPLMaster record
+                        _aid = _rr.get("recordName")
+                        if _aid and _aid not in _asset_ids:
+                            _asset_ids.append(_aid)
+                        _items_this_page += 1
+                    elif _rt == "CPLAsset":
+                        pass  # sibling of CPLMaster; not counted for offset
                     else:
-                        sub = shared_out
+                        # CPLContainerRelation record — extract assetId field
+                        _aid = (_rr.get("fields", {})
+                                .get("assetId", {}).get("value"))
+                        if _aid and _aid not in _asset_ids:
+                            _asset_ids.append(_aid)
+                        _items_this_page += 1
 
-                    os.makedirs(sub, exist_ok=True)
-                    target = os.path.join(sub, photo.filename)
+                if len(_page_recs) < _page_size:
+                    break  # last page — fewer records returned than requested
+                _offset += _items_this_page
 
-                    if os.path.exists(target):
+            logs.append(("info",
+                         f"[{alb_name}] {len(_asset_ids)} album member IDs "
+                         f"from PrimarySync relations"))
+
+            if not _asset_ids:
+                continue
+
+            # ── Step 2: look up those assetIds in SharedSync zone ─────────
+            # Records that exist in SharedSync are cross-zone photos that need
+            # to be downloaded; records not found have serverErrorCode set.
+            _ss_photos: list = []  # list of PhotoAsset for SharedSync members
+            _CHUNK = 50            # lookup endpoint has size limits
+            for _i in range(0, len(_asset_ids), _CHUNK):
+                _chunk = _asset_ids[_i:_i + _CHUNK]
+                _lu_url = (f"{shared_svc.service_endpoint}/records/lookup?"
+                           f"{_up.urlencode(shared_svc.params)}")
+                _lu_body = _json.dumps({
+                    "records": [{"recordName": aid} for aid in _chunk],
+                    "zoneID": shared_svc.zone_id,
+                })
+                try:
+                    _lu_r = shared_svc.session.post(
+                        _lu_url, data=_lu_body,
+                        headers={"Content-type": "text/plain"})
+                    for _lu_rec in _lu_r.json().get("records", []):
+                        if ("serverErrorCode" in _lu_rec
+                                or _lu_rec.get("recordType") != "CPLMaster"):
+                            continue
+                        # Build a minimal asset_record so PhotoAsset.versions
+                        # falls back to the master record for download URLs.
+                        # Copy assetDate if present in master fields (rare but
+                        # possible depending on API response).
+                        _fake_asset = {
+                            "fields": {
+                                k: v
+                                for k, v in _lu_rec.get("fields", {}).items()
+                                if k in ("assetDate", "addedDate")
+                            }
+                        }
+                        _ss_photos.append(_PAsset(_lu_rec, _fake_asset))
+                except Exception as _lue:
+                    logs.append(("warning",
+                                 f"SharedSync lookup chunk failed "
+                                 f"for '{alb_name}': {_lue}"))
+
+            logs.append(("info",
+                         f"[{alb_name}] {len(_ss_photos)} SharedSync photos "
+                         f"found for download"))
+
+            # ── Step 3: download SharedSync photos into album folder ───────
+            for _photo in _ss_photos:
+                if run_id in self.stop_requested:
+                    break
+
+                try:
+                    year_str = _photo.created.strftime(strftime_fmt)
+                except Exception:
+                    year_str = "unknown"
+
+                if job.get("organize_by_year") and job.get("organize_by_album"):
+                    sub = os.path.join(shared_out, year_str, safe_album)
+                elif job.get("organize_by_year"):
+                    sub = os.path.join(shared_out, year_str)
+                elif job.get("organize_by_album"):
+                    sub = os.path.join(shared_out, safe_album)
+                else:
+                    sub = shared_out
+
+                os.makedirs(sub, exist_ok=True)
+
+                try:
+                    _fname = _photo.filename
+                except Exception:
+                    _fname = f"{_photo.id}.bin"
+
+                target = os.path.join(sub, _fname)
+                if os.path.exists(target):
+                    continue
+
+                try:
+                    _versions = _photo.versions
+                    _ver_obj = None
+                    for _vk, _vv in _versions.items():
+                        if "original" in str(_vk).lower():
+                            _ver_obj = _vv
+                            break
+                    if _ver_obj is None and _versions:
+                        _ver_obj = next(iter(_versions.values()))
+                    if _ver_obj is None:
                         continue
 
-                    # Download via the authenticated session
-                    try:
-                        versions = getattr(photo, "versions", {})
-                        # Pick the original version; fall back to any version
-                        version_obj = None
-                        for _key, _ver in versions.items():
-                            if "original" in str(_key).lower():
-                                version_obj = _ver
-                                break
-                        if version_obj is None and versions:
-                            version_obj = next(iter(versions.values()))
-                        if version_obj is None:
-                            continue
+                    _url = getattr(_ver_obj, "url", None)
+                    if not _url:
+                        continue
 
-                        url = getattr(version_obj, "url", None)
-                        if not url:
-                            continue
+                    _resp = shared_svc.session.get(_url, stream=True)
+                    _resp.raise_for_status()
+                    with open(target, "wb") as _f:
+                        for _chunk in _resp.iter_content(chunk_size=8192):
+                            if _chunk:
+                                _f.write(_chunk)
+                    downloaded += 1
 
-                        resp = shared_svc.session.get(url, stream=True)
-                        resp.raise_for_status()
-                        with open(target, "wb") as f:
-                            for chunk in resp.iter_content(chunk_size=8192):
-                                if chunk:
-                                    f.write(chunk)
-                        downloaded += 1
-
-                    except Exception as dl_exc:
-                        logs.append(("warning",
-                                     f"Failed to download '{photo.filename}': {dl_exc}"))
-
-            except Exception as exc:
-                logs.append(("warning",
-                             f"Error iterating cross-zone album '{alb_name}': {exc}"))
-                continue
+                except Exception as _dl_exc:
+                    logs.append(("warning",
+                                 f"Failed to download '{_fname}': {_dl_exc}"))
 
             if downloaded > 0:
                 logs.append(("info",
