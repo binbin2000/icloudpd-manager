@@ -376,6 +376,20 @@ class ProcessManager:
                          f"pyicloud_ipd auth failed: {exc} — shared-album sync skipped"))
             return logs
 
+        # Apply a 30-second timeout to every HTTP request the pyicloud_ipd
+        # session makes.  Without this, calls to iCloud's CloudKit endpoints
+        # can hang indefinitely when the API is slow or unresponsive.
+        try:
+            _sess = getattr(icloud, "session", None)
+            if _sess is not None:
+                _orig_req = _sess.request
+                def _req_timeout(*_a, **_kw):
+                    _kw.setdefault("timeout", 30)
+                    return _orig_req(*_a, **_kw)
+                _sess.request = _req_timeout
+        except Exception:
+            pass  # best-effort; don't abort if patching fails
+
         if getattr(icloud, "requires_2fa", False) or getattr(icloud, "requires_2sa", False):
             logs.append(("warning",
                          "iCloud 2FA required — shared-album sync skipped"))
@@ -391,7 +405,8 @@ class ProcessManager:
                 ep = icloud.photos.get_service_endpoint(library_type)
                 r = icloud.photos.session.post(
                     f"{ep}/zones/list", data="{}",
-                    headers={"Content-type": "text/plain"})
+                    headers={"Content-type": "text/plain"},
+                    timeout=30)
                 return r.json().get("zones", [])
             except Exception as _e:
                 logs.append(("info", f"zones/list({library_type}) error: {_e}"))
@@ -458,7 +473,8 @@ class ProcessManager:
             _body = _json.dumps({"query": {"recordType": "CPLAlbumByPositionLive"},
                                  "zoneID": _ps_zone})
             _r = icloud.photos.session.post(_url, data=_body,
-                                            headers={"Content-type": "text/plain"})
+                                            headers={"Content-type": "text/plain"},
+                                            timeout=30)
             _folder_records = _r.json().get("records", [])
             logs.append(("info", f"CPLAlbumByPositionLive returned {len(_folder_records)} records"))
         except Exception as _fe:
@@ -523,7 +539,8 @@ class ProcessManager:
                 })
                 try:
                     resp = session.post(url, data=body,
-                                        headers={"Content-type": "text/plain"})
+                                        headers={"Content-type": "text/plain"},
+                                        timeout=30)
                     recs = resp.json().get("records", [])
                 except Exception:
                     break
@@ -635,7 +652,8 @@ class ProcessManager:
                     try:
                         _lu_r = _zone_session.post(
                             _lu_url, data=_lu_body,
-                            headers={"Content-type": "text/plain"})
+                            headers={"Content-type": "text/plain"},
+                            timeout=30)
                         for _lu_rec in _lu_r.json().get("records", []):
                             if ("serverErrorCode" in _lu_rec
                                     or _lu_rec.get("recordType") != "CPLMaster"):
@@ -708,7 +726,7 @@ class ProcessManager:
                     if not _url:
                         continue
 
-                    _resp = shared_svc.session.get(_url, stream=True)
+                    _resp = shared_svc.session.get(_url, stream=True, timeout=60)
                     _resp.raise_for_status()
                     with open(target, "wb") as _f:
                         for _chunk in _resp.iter_content(chunk_size=8192):
@@ -733,15 +751,26 @@ class ProcessManager:
         """
         Async wrapper: runs _run_shared_album_sync_blocking in a thread
         executor so it does not block the event loop, then logs all messages.
+        A 10-minute hard timeout prevents a stuck iCloud API call from
+        blocking the entire sync indefinitely.
         """
         if not albums or not job.get("library"):
             return
         loop = asyncio.get_event_loop()
-        logs: List[tuple] = await loop.run_in_executor(
-            None,
-            self._run_shared_album_sync_blocking,
-            job, albums, run_id,
-        )
+        try:
+            logs: List[tuple] = await asyncio.wait_for(
+                loop.run_in_executor(
+                    None,
+                    self._run_shared_album_sync_blocking,
+                    job, albums, run_id,
+                ),
+                timeout=600,  # 10 minutes max for the entire album-sync phase
+            )
+        except asyncio.TimeoutError:
+            await self._log(run_id, job_id, "warning",
+                            "Shared album sync timed out after 10 minutes — "
+                            "skipping album-based SharedSync detection")
+            return
         for level, msg in logs:
             await self._log(run_id, job_id, level, msg)
 
