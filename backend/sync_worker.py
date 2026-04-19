@@ -498,17 +498,53 @@ class ProcessManager:
         logs.append(("info",
                      f"User albums found: {list(_album_record_map.keys())[:10]}"))
 
+        # ── Also query CPLAlbumByPositionLive in SharedSync zone ─────────────
+        # iCloud may store a shadow/mirror album record in SharedSync zone with
+        # a different recordName.  SharedSync relation records then use THAT
+        # recordName as their parentId, not the PrimarySync one.
+        _ss_album_record_map: dict = {}  # album_name → SharedSync folder_record_name
+        if shared_svc is not None:
+            try:
+                _ss_alb_url = (f"{shared_svc.service_endpoint}/records/query?"
+                               f"{_up.urlencode(shared_svc.params)}")
+                _ss_alb_body = _json.dumps({
+                    "query": {"recordType": "CPLAlbumByPositionLive"},
+                    "zoneID": shared_svc.zone_id,
+                })
+                _ss_alb_r = shared_svc.session.post(
+                    _ss_alb_url, data=_ss_alb_body,
+                    headers={"Content-type": "text/plain"},
+                    timeout=30)
+                _ss_alb_recs = _ss_alb_r.json().get("records", [])
+                logs.append(("info",
+                             f"SharedSync CPLAlbumByPositionLive: "
+                             f"{len(_ss_alb_recs)} records"))
+                for _rec in _ss_alb_recs:
+                    _rn = _rec.get("recordName", "")
+                    if _rn in ("----Root-Folder----", "----Project-Root-Folder----"):
+                        continue
+                    if _rec.get("fields", {}).get("isDeleted", {}).get("value"):
+                        continue
+                    _enc = _rec.get("fields", {}).get("albumNameEnc", {}).get("value", "")
+                    if _enc:
+                        try:
+                            _aname = _b64.b64decode(_enc).decode("utf-8")
+                            _ss_album_record_map[_aname] = _rn
+                        except Exception:
+                            pass
+                if _ss_album_record_map:
+                    logs.append(("info",
+                                 f"SharedSync albums: "
+                                 f"{list(_ss_album_record_map.keys())[:10]}"))
+            except Exception as _ssae:
+                logs.append(("info",
+                             f"SharedSync CPLAlbumByPositionLive query: {_ssae}"))
+
         # ── Per-album: find SharedSync photos that belong to PrimarySync albums ──
-        #
-        # Albums and CPLContainerRelation membership records always live in
-        # PrimarySync zone.  Each relation record has an assetId field that
-        # references a CPLMaster record — which may live in either PrimarySync
-        # or SharedSync zone.  We query PrimarySync for the relation records,
-        # extract assetIds, then look up those IDs in the SharedSync zone to
-        # identify the cross-zone photos and download them.
         from pyicloud_ipd.services.photos import PhotoAsset as _PAsset  # type: ignore
 
-        def _rel_query_pages(ep, params, session, zone_id, parent_id):
+        def _rel_query_pages(ep, params, session, zone_id, parent_id,
+                             label=""):
             """
             Page through CPLContainerRelationLiveByAssetDate in a zone,
             filtered by parentId.  Yields individual CloudKit record dicts.
@@ -542,7 +578,10 @@ class ProcessManager:
                                         headers={"Content-type": "text/plain"},
                                         timeout=30)
                     recs = resp.json().get("records", [])
-                except Exception:
+                except Exception as _qe:
+                    logs.append(("info",
+                                 f"_rel_query_pages [{label}] error "
+                                 f"(offset={offset}): {_qe}"))
                     break
                 for r in recs:
                     yield r
@@ -584,8 +623,12 @@ class ProcessManager:
             #
             # CPLContainerRelation records live in the SAME zone as the photo
             # they reference.  Personal photos → relations in PrimarySync;
-            # Shared Library photos → relations in SharedSync.  Both sets use
-            # the same parentId (PrimarySync album folder_record_name).
+            # Shared Library photos → relations in SharedSync.
+            #
+            # For the SharedSync zone query we first try the SharedSync
+            # album's own record name (if the album has a mirror record in
+            # SharedSync with a different name), falling back to the
+            # PrimarySync folder_record_name.
             #
             # We process each zone's response records the same way:
             #   • CPLMaster   → photo is in this zone; create PhotoAsset now
@@ -596,36 +639,52 @@ class ProcessManager:
             _ss_photos: list = []    # final list of PhotoAsset
             _seen_ids: set = set()
 
-            for _zone_label, _zone_ep, _zone_params, _zone_id, _zone_session in [
+            # parentIds to try for each zone
+            _ps_parent  = folder_record_name
+            _ss_parents = list({_ss_album_record_map.get(alb_name),
+                                 folder_record_name} - {None})
+
+            for _zone_label, _zone_ep, _zone_params, _zone_id, _zone_session, _parents in [
                 ("PrimarySync", _ps_ep,
                  icloud.photos.params, _ps_zone,
-                 icloud.photos.session),
+                 icloud.photos.session, [_ps_parent]),
                 ("SharedSync",  shared_svc.service_endpoint,
                  shared_svc.params, shared_svc.zone_id,
-                 shared_svc.session),
+                 shared_svc.session, _ss_parents),
             ]:
                 _masters: dict = {}      # recordName → CPLMaster record
                 _asset_recs: dict = {}   # masterRecordName → CPLAsset record
                 _rel_ids: list = []      # assetIds from relation records
+                _unknown_types: set = set()
 
-                for _rr in _rel_query_pages(
-                        _zone_ep, _zone_params, _zone_session,
-                        _zone_id, folder_record_name):
-                    _rt = _rr.get("recordType", "")
-                    if _rt == "CPLMaster":
-                        _masters[_rr["recordName"]] = _rr
-                    elif _rt == "CPLAsset":
-                        _mid = (_rr.get("fields", {})
-                                .get("masterRef", {})
-                                .get("value", {})
-                                .get("recordName"))
-                        if _mid:
-                            _asset_recs[_mid] = _rr
-                    else:
-                        _aid = (_rr.get("fields", {})
-                                .get("assetId", {}).get("value"))
-                        if _aid:
-                            _rel_ids.append(_aid)
+                for _parent_id in _parents:
+                    for _rr in _rel_query_pages(
+                            _zone_ep, _zone_params, _zone_session,
+                            _zone_id, _parent_id,
+                            label=f"{_zone_label}/{_parent_id[:12]}"):
+                        _rt = _rr.get("recordType", "")
+                        if _rt == "CPLMaster":
+                            _masters[_rr["recordName"]] = _rr
+                        elif _rt == "CPLAsset":
+                            _mid = (_rr.get("fields", {})
+                                    .get("masterRef", {})
+                                    .get("value", {})
+                                    .get("recordName"))
+                            if _mid:
+                                _asset_recs[_mid] = _rr
+                        else:
+                            _aid = (_rr.get("fields", {})
+                                    .get("assetId", {}).get("value"))
+                            if _aid:
+                                _rel_ids.append(_aid)
+                            else:
+                                _unknown_types.add(_rt)
+
+                if _unknown_types:
+                    logs.append(("info",
+                                 f"[{alb_name}] {_zone_label}: "
+                                 f"unknown record types (no assetId): "
+                                 f"{_unknown_types}"))
 
                 # Build PhotoAssets for CPLMaster records returned directly
                 for _mr_id, _mr in _masters.items():
