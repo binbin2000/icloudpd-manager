@@ -657,28 +657,56 @@ class ProcessManager:
                 _rel_ids: list = []      # assetIds from relation records
                 _unknown_types: set = set()
 
+                _logged_ct_fields = False  # log CPLContainerRelation fields once
                 for _parent_id in _parents:
                     for _rr in _rel_query_pages(
                             _zone_ep, _zone_params, _zone_session,
                             _zone_id, _parent_id,
                             label=f"{_zone_label}/{_parent_id[:12]}"):
                         _rt = _rr.get("recordType", "")
+                        _rr_fields = _rr.get("fields", {})
                         if _rt == "CPLMaster":
                             _masters[_rr["recordName"]] = _rr
                         elif _rt == "CPLAsset":
-                            _mid = (_rr.get("fields", {})
+                            _mid = (_rr_fields
                                     .get("masterRef", {})
                                     .get("value", {})
                                     .get("recordName"))
                             if _mid:
                                 _asset_recs[_mid] = _rr
                         else:
-                            _aid = (_rr.get("fields", {})
-                                    .get("assetId", {}).get("value"))
-                            if _aid:
+                            # Try STRING assetId first (same-zone reference)
+                            _aid = _rr_fields.get("assetId", {}).get("value")
+                            if isinstance(_aid, str) and _aid:
                                 _rel_ids.append(_aid)
                             else:
-                                _unknown_types.add(_rt)
+                                # Try any REFERENCE-type field that could be
+                                # a cross-zone link to SharedSync.
+                                _ref_rn = None
+                                _ref_zone = ""
+                                for _fn, _fv in _rr_fields.items():
+                                    if _fv.get("type") == "REFERENCE":
+                                        _rv = _fv.get("value", {})
+                                        if isinstance(_rv, dict) and _rv.get("recordName"):
+                                            _ref_rn = _rv["recordName"]
+                                            _ref_zone = (_rv.get("zoneID", {})
+                                                         .get("zoneName", ""))
+                                            break
+                                if _ref_rn:
+                                    _rel_ids.append(_ref_rn)
+                                else:
+                                    _unknown_types.add(_rt)
+
+                                # Log field names+types of the first such record
+                                if not _logged_ct_fields and _rt:
+                                    _logged_ct_fields = True
+                                    _fsummary = {
+                                        fn: fv.get("type", "?")
+                                        for fn, fv in _rr_fields.items()
+                                    }
+                                    logs.append(("info",
+                                                 f"[{alb_name}] {_zone_label} "
+                                                 f"{_rt} fields: {_fsummary}"))
 
                 if _unknown_types:
                     logs.append(("info",
