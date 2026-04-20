@@ -806,6 +806,7 @@ class ProcessManager:
             logs.append(("info",
                          f"[{alb_name}] PrimarySync sort-index: "
                          f"{len(_all_masters)} masters, "
+                         f"{len(_all_assets)} assets, "
                          f"{len(_rel_ids)} stubs"))
 
             # ── Strategy A: batch-lookup all master recordNames in SharedSync
@@ -826,8 +827,6 @@ class ProcessManager:
                             _photo_from_master(_mr, _all_assets.get(_rn)))
 
             # ── Strategy B: look up stubs in SharedSync (cross-zone refs) ──
-            # The same stubs also exist in PrimarySync but as CPLAsset, not
-            # CPLMaster, so no need to look them up there.
             if _rel_ids:
                 _ss_stub_hits = _lookup_masters(
                     _ss_ep, _ss_params, _ss_session, _ss_zone_id,
@@ -838,6 +837,25 @@ class ProcessManager:
                              f"{len(_rel_ids)} stubs → "
                              f"{len(_ss_stub_hits)} hits"))
                 for _rn, _mr in _ss_stub_hits.items():
+                    if _rn not in _seen_ids:
+                        _seen_ids.add(_rn)
+                        _ss_photos.append(
+                            _photo_from_master(_mr, _all_assets.get(_rn)))
+
+            # ── Strategy D: look up CPLAsset masterRef keys in SharedSync ──
+            # The PrimarySync sort-index may return CPLAsset records for
+            # SharedSync photos, where masterRef.recordName points to the
+            # SharedSync CPLMaster.  _all_assets is keyed by that record name.
+            if _all_assets:
+                _ss_asset_hits = _lookup_masters(
+                    _ss_ep, _ss_params, _ss_session, _ss_zone_id,
+                    list(_all_assets.keys()),
+                    label=f"{alb_name[:20]}/ss-asset-refs")
+                logs.append(("info",
+                             f"[{alb_name}] SharedSync lookup of "
+                             f"{len(_all_assets)} asset masterRefs → "
+                             f"{len(_ss_asset_hits)} hits"))
+                for _rn, _mr in _ss_asset_hits.items():
                     if _rn not in _seen_ids:
                         _seen_ids.add(_rn)
                         _ss_photos.append(
