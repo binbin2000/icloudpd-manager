@@ -543,14 +543,38 @@ class ProcessManager:
         # ── Per-album: find SharedSync photos that belong to PrimarySync albums ──
         from pyicloud_ipd.services.photos import PhotoAsset as _PAsset  # type: ignore
 
+        # desiredKeys list from pyicloud_ipd PhotoAlbum._list_query_gen.
+        # When these keys are included, CloudKit expands the sort-index and
+        # returns CPLMaster records for cross-zone (SharedSync) photos alongside
+        # same-zone ones.  Without desiredKeys, cross-zone photos appear only
+        # as raw CPLContainerRelation stubs (or not at all).
+        _DESIRED_KEYS = [
+            "resJPEGFullRes", "resJPEGLargeRes", "resJPEGMedRes",
+            "resJPEGThumbRes", "resVidFullRes", "resVidMedRes",
+            "resVidSmallRes", "resSidecarRes",
+            "resOriginalRes", "resOriginalAltRes", "resOriginalVidComplRes",
+            "resJPEGFullWidth", "resJPEGFullHeight", "resJPEGFullFileType",
+            "resJPEGFullFingerprint",
+            "resOriginalWidth", "resOriginalHeight", "resOriginalFileType",
+            "resOriginalFingerprint",
+            "itemType", "dataClassType", "filenameEnc", "originalOrientation",
+            "isDeleted", "isExpunged", "dateExpunged", "remappedRef",
+            "recordName", "recordType", "recordChangeTag",
+            "masterRef", "adjustmentRenderType", "assetDate",
+            "containerId", "itemId", "position", "isKeyAsset",
+        ]
+
         def _rel_query_pages(ep, params, session, zone_id, parent_id,
                              label=""):
             """
             Page through CPLContainerRelationLiveByAssetDate in a zone,
-            filtered by parentId.  Yields individual CloudKit record dicts.
+            filtered by parentId, with desiredKeys so CloudKit expands
+            cross-zone (SharedSync) records into full CPLMaster entries.
+            Yields individual CloudKit record dicts.
             """
             offset = 0
-            page_size = 500
+            page_size = 100   # match icloudpd default
+            results_limit = page_size * 2  # 1 CPLMaster + 1 CPLAsset per photo
             while True:
                 url = f"{ep}/records/query?{_up.urlencode(params)}"
                 body = _json.dumps({
@@ -570,14 +594,23 @@ class ProcessManager:
                         ],
                         "recordType": "CPLContainerRelationLiveByAssetDate",
                     },
-                    "resultsLimit": page_size,
+                    "resultsLimit": results_limit,
+                    "desiredKeys": _DESIRED_KEYS,
                     "zoneID": zone_id,
                 })
                 try:
                     resp = session.post(url, data=body,
                                         headers={"Content-type": "text/plain"},
                                         timeout=30)
-                    recs = resp.json().get("records", [])
+                    resp_json = resp.json()
+                    recs = resp_json.get("records", [])
+                    if not recs and offset == 0:
+                        # Log raw response for diagnosis when a query returns
+                        # nothing on the first page.
+                        logs.append(("info",
+                                     f"_rel_query_pages [{label}] 0 records "
+                                     f"(HTTP {resp.status_code}): "
+                                     f"{str(resp_json)[:300]}"))
                 except Exception as _qe:
                     logs.append(("info",
                                  f"_rel_query_pages [{label}] error "
@@ -585,13 +618,13 @@ class ProcessManager:
                     break
                 for r in recs:
                     yield r
-                # CPLAsset sibling records don't count toward the startRank
-                # offset; only CPLMaster and CPLContainerRelation do.
-                items = sum(1 for r in recs
-                            if r.get("recordType") != "CPLAsset")
-                if len(recs) < page_size:
+                # Only CPLMaster records count toward the startRank offset;
+                # CPLAsset sibling records and CPLContainerRelation stubs do not.
+                masters_in_page = sum(1 for r in recs
+                                      if r.get("recordType") == "CPLMaster")
+                if masters_in_page == 0 or len(recs) < results_limit:
                     break
-                offset += items
+                offset += masters_in_page
 
         def _photo_from_master(master_rec, asset_rec=None):
             """Wrap a CPLMaster + optional CPLAsset record in a PhotoAsset."""
@@ -608,6 +641,75 @@ class ProcessManager:
                 }
             return _PAsset(master_rec, asset_rec)
 
+        # ── Helpers for cross-zone asset lookup ──────────────────────────
+        _ss_ep      = shared_svc.service_endpoint
+        _ss_params  = shared_svc.params
+        _ss_zone_id = shared_svc.zone_id
+        _ss_session = shared_svc.session
+
+        def _lookup_masters(ep, params, session, zone_id, record_names,
+                            label=""):
+            """
+            Batch-lookup record_names in zone.  For each CPLAsset returned,
+            immediately follow its masterRef to fetch the CPLMaster.
+            Returns a dict {masterRecordName: CPLMaster_record} for hits.
+            """
+            _found: dict = {}
+            _need_master: list = []   # (asset_record_name, master_rn) tuples
+            _CHUNK = 50
+            all_rns = list(record_names)
+            for _ci in range(0, len(all_rns), _CHUNK):
+                _chunk = all_rns[_ci:_ci + _CHUNK]
+                _lu_body = _json.dumps({
+                    "records": [{"recordName": rn} for rn in _chunk],
+                    "zoneID": zone_id,
+                })
+                try:
+                    _lu_r = session.post(
+                        f"{ep}/records/lookup?{_up.urlencode(params)}",
+                        data=_lu_body,
+                        headers={"Content-type": "text/plain"},
+                        timeout=30)
+                    for _lr in _lu_r.json().get("records", []):
+                        if "serverErrorCode" in _lr:
+                            continue
+                        _lrt = _lr.get("recordType", "")
+                        if _lrt == "CPLMaster":
+                            _found[_lr["recordName"]] = _lr
+                        elif _lrt == "CPLAsset":
+                            _mrn = (_lr.get("fields", {})
+                                    .get("masterRef", {})
+                                    .get("value", {})
+                                    .get("recordName"))
+                            if _mrn:
+                                _need_master.append(_mrn)
+                except Exception as _le:
+                    logs.append(("info",
+                                 f"_lookup_masters [{label}] chunk error: {_le}"))
+
+            # Second-level lookup: fetch CPLMaster for CPLAsset hits
+            for _ci in range(0, len(_need_master), _CHUNK):
+                _chunk2 = _need_master[_ci:_ci + _CHUNK]
+                _lu2_body = _json.dumps({
+                    "records": [{"recordName": rn} for rn in _chunk2],
+                    "zoneID": zone_id,
+                })
+                try:
+                    _lu2_r = session.post(
+                        f"{ep}/records/lookup?{_up.urlencode(params)}",
+                        data=_lu2_body,
+                        headers={"Content-type": "text/plain"},
+                        timeout=30)
+                    for _lr2 in _lu2_r.json().get("records", []):
+                        if ("serverErrorCode" not in _lr2
+                                and _lr2.get("recordType") == "CPLMaster"):
+                            _found[_lr2["recordName"]] = _lr2
+                except Exception as _le2:
+                    logs.append(("info",
+                                 f"_lookup_masters [{label}] master-fetch error: "
+                                 f"{_le2}"))
+            return _found
+
         for alb_name in albums:
             if run_id in self.stop_requested:
                 break
@@ -619,188 +721,109 @@ class ProcessManager:
             safe_album = alb_name.replace("/", "_").replace("\\", "_")
             downloaded = 0
 
-            # ── Step 1: collect SharedSync photos from BOTH zones ──────────
+            # ── Step 1: find SharedSync photos for this album ──────────────
             #
-            # CPLContainerRelation records live in the SAME zone as the photo
-            # they reference.  Personal photos → relations in PrimarySync;
-            # Shared Library photos → relations in SharedSync.
+            # Strategy:
+            #   A) Query PrimarySync sort-index with desiredKeys.  With these
+            #      keys CloudKit expands cross-zone references and returns
+            #      CPLMaster records for SharedSync photos alongside PrimarySync
+            #      ones.  We then batch-lookup all returned recordNames in
+            #      SharedSync to identify which are SharedSync photos.
             #
-            # For the SharedSync zone query we first try the SharedSync
-            # album's own record name (if the album has a mirror record in
-            # SharedSync with a different name), falling back to the
-            # PrimarySync folder_record_name.
+            #   B) For any CPLContainerRelation stubs still returned (itemId
+            #      field), look them up in BOTH zones (same and SharedSync) —
+            #      the cross-zone ones live in SharedSync.
             #
-            # We process each zone's response records the same way:
-            #   • CPLMaster   → photo is in this zone; create PhotoAsset now
-            #   • CPLAsset    → sibling of CPLMaster; used for date fields
-            #   • other type  → CPLContainerRelation; extract assetId, then
-            #                   look up in that zone to get the CPLMaster
+            #   C) Log raw responses when 0 records come back so we can
+            #      diagnose the CloudKit data structure for this account.
 
-            _ss_photos: list = []    # final list of PhotoAsset
+            _ss_photos: list = []
             _seen_ids: set = set()
 
-            # parentIds to try for each zone
-            _ps_parent  = folder_record_name
-            _ss_parents = list({_ss_album_record_map.get(alb_name),
-                                 folder_record_name} - {None})
+            # All CPLMaster records found via sort-index query
+            _all_masters: dict = {}   # recordName → CPLMaster record
+            _all_assets: dict = {}    # masterRecordName → CPLAsset record
+            _rel_ids: list = []       # itemId / assetId stubs to look up
+            _unknown_types: set = set()
 
-            for _zone_label, _zone_ep, _zone_params, _zone_id, _zone_session, _parents in [
-                ("PrimarySync", _ps_ep,
-                 icloud.photos.params, _ps_zone,
-                 icloud.photos.session, [_ps_parent]),
-                ("SharedSync",  shared_svc.service_endpoint,
-                 shared_svc.params, shared_svc.zone_id,
-                 shared_svc.session, _ss_parents),
-            ]:
-                _masters: dict = {}      # recordName → CPLMaster record
-                _asset_recs: dict = {}   # masterRecordName → CPLAsset record
-                _rel_ids: list = []      # assetIds from relation records
-                _unknown_types: set = set()
-
-                _logged_ct_fields = False  # log CPLContainerRelation fields once
-                for _parent_id in _parents:
-                    for _rr in _rel_query_pages(
-                            _zone_ep, _zone_params, _zone_session,
-                            _zone_id, _parent_id,
-                            label=f"{_zone_label}/{_parent_id[:12]}"):
-                        _rt = _rr.get("recordType", "")
-                        _rr_fields = _rr.get("fields", {})
-                        if _rt == "CPLMaster":
-                            _masters[_rr["recordName"]] = _rr
-                        elif _rt == "CPLAsset":
-                            _mid = (_rr_fields
-                                    .get("masterRef", {})
-                                    .get("value", {})
-                                    .get("recordName"))
-                            if _mid:
-                                _asset_recs[_mid] = _rr
+            for _parent_id in [folder_record_name]:
+                for _rr in _rel_query_pages(
+                        _ps_ep, icloud.photos.params,
+                        icloud.photos.session, _ps_zone,
+                        _parent_id,
+                        label=f"PS/{_parent_id[:12]}"):
+                    _rt = _rr.get("recordType", "")
+                    _rr_fields = _rr.get("fields", {})
+                    if _rt == "CPLMaster":
+                        _all_masters[_rr["recordName"]] = _rr
+                    elif _rt == "CPLAsset":
+                        _mid = (_rr_fields
+                                .get("masterRef", {})
+                                .get("value", {})
+                                .get("recordName"))
+                        if _mid:
+                            _all_assets[_mid] = _rr
+                    else:
+                        # CPLContainerRelation stub (cross-zone, no desiredKeys
+                        # expansion, or unexpected record type)
+                        _aid = (
+                            _rr_fields.get("itemId", {}).get("value")
+                            or _rr_fields.get("assetId", {}).get("value")
+                        )
+                        if isinstance(_aid, str) and _aid:
+                            _rel_ids.append(_aid)
                         else:
-                            # CPLContainerRelationLiveByAssetDate query may
-                            # return:
-                            #  • CPLContainerRelationLiveByAssetDate records
-                            #    with STRING assetId  (same-zone)
-                            #  • CPLContainerRelation records with STRING
-                            #    itemId  (cross-zone SharedSync reference)
-                            #  • REFERENCE-type fields for other cross-zone links
-                            _aid = (
-                                _rr_fields.get("assetId", {}).get("value")
-                                or _rr_fields.get("itemId", {}).get("value")
-                            )
-                            if isinstance(_aid, str) and _aid:
-                                _rel_ids.append(_aid)
+                            for _fn, _fv in _rr_fields.items():
+                                if _fv.get("type") == "REFERENCE":
+                                    _rv = _fv.get("value", {})
+                                    if isinstance(_rv, dict):
+                                        _ref_rn = _rv.get("recordName")
+                                        if _ref_rn:
+                                            _rel_ids.append(_ref_rn)
+                                            break
                             else:
-                                # Fallback: scan for any REFERENCE-type field
-                                for _fn, _fv in _rr_fields.items():
-                                    if _fv.get("type") == "REFERENCE":
-                                        _rv = _fv.get("value", {})
-                                        if isinstance(_rv, dict):
-                                            _ref_rn = _rv.get("recordName")
-                                            if _ref_rn:
-                                                _rel_ids.append(_ref_rn)
-                                                break
-                                else:
-                                    _unknown_types.add(_rt)
+                                _unknown_types.add(_rt)
 
-                # ── Fallback: direct CPLContainerRelation query ───────────
-                # If the sort-index query above found nothing (albums where
-                # ALL photos are in SharedSync), try querying the underlying
-                # CPLContainerRelation record type directly, filtering by
-                # containerId (the album record name).  This bypasses the
-                # sort index and may surface cross-zone relations not indexed.
-                if not _masters and not _rel_ids:
-                    for _parent_id in _parents:
-                        try:
-                            _ct_url = (f"{_zone_ep}/records/query?"
-                                       f"{_up.urlencode(_zone_params)}")
-                            _ct_body = _json.dumps({
-                                "query": {
-                                    "filterBy": [
-                                        {"fieldName": "containerId",
-                                         "comparator": "EQUALS",
-                                         "fieldValue": {"type": "STRING",
-                                                        "value": _parent_id}},
-                                    ],
-                                    "recordType": "CPLContainerRelation",
-                                },
-                                "resultsLimit": 500,
-                                "zoneID": _zone_id,
-                            })
-                            _ct_r = _zone_session.post(
-                                _ct_url, data=_ct_body,
-                                headers={"Content-type": "text/plain"},
-                                timeout=30)
-                            _ct_recs = _ct_r.json().get("records", [])
-                            logs.append(("info",
-                                         f"[{alb_name}] {_zone_label} "
-                                         f"direct CPLContainerRelation query: "
-                                         f"{len(_ct_recs)} records"))
-                            for _cr in _ct_recs:
-                                _cr_fields = _cr.get("fields", {})
-                                _item = (
-                                    _cr_fields.get("itemId", {}).get("value")
-                                    or _cr_fields.get("assetId", {}).get("value")
-                                )
-                                if isinstance(_item, str) and _item:
-                                    _rel_ids.append(_item)
-                        except Exception as _cte:
-                            logs.append(("info",
-                                         f"[{alb_name}] {_zone_label} "
-                                         f"direct CPLContainerRelation failed: "
-                                         f"{_cte}"))
+            logs.append(("info",
+                         f"[{alb_name}] PrimarySync sort-index: "
+                         f"{len(_all_masters)} masters, "
+                         f"{len(_rel_ids)} stubs, "
+                         f"unknown={_unknown_types}"))
 
-                if _unknown_types:
-                    logs.append(("info",
-                                 f"[{alb_name}] {_zone_label}: "
-                                 f"unknown record types: {_unknown_types}"))
-
-                # Build PhotoAssets for CPLMaster records returned directly
-                for _mr_id, _mr in _masters.items():
-                    if _mr_id not in _seen_ids:
-                        # Only add photos that are actually in SharedSync zone.
-                        # PrimarySync photos are handled by the regular sync.
-                        if _zone_label == "SharedSync":
-                            _seen_ids.add(_mr_id)
-                            _ss_photos.append(_photo_from_master(
-                                _mr, _asset_recs.get(_mr_id)))
-                        else:
-                            _seen_ids.add(_mr_id)  # mark seen, skip download
-
-                # For relation-only records, look up the asset in the same zone
-                _CHUNK = 50
-                for _ci in range(0, len(_rel_ids), _CHUNK):
-                    _chunk = _rel_ids[_ci:_ci + _CHUNK]
-                    _lu_url = (f"{_zone_ep}/records/lookup?"
-                               f"{_up.urlencode(_zone_params)}")
-                    _lu_body = _json.dumps({
-                        "records": [{"recordName": aid} for aid in _chunk],
-                        "zoneID": _zone_id,
-                    })
-                    try:
-                        _lu_r = _zone_session.post(
-                            _lu_url, data=_lu_body,
-                            headers={"Content-type": "text/plain"},
-                            timeout=30)
-                        for _lu_rec in _lu_r.json().get("records", []):
-                            if ("serverErrorCode" in _lu_rec
-                                    or _lu_rec.get("recordType") != "CPLMaster"):
-                                continue
-                            _rn = _lu_rec["recordName"]
-                            if _rn in _seen_ids:
-                                continue
-                            _seen_ids.add(_rn)
-                            if _zone_label == "SharedSync":
-                                _ss_photos.append(
-                                    _photo_from_master(_lu_rec))
-                            # PrimarySync photos: mark seen, skip download
-                    except Exception as _lue:
-                        logs.append(("warning",
-                                     f"[{alb_name}] {_zone_label} lookup "
-                                     f"chunk failed: {_lue}"))
-
+            # ── Strategy A: batch-lookup all master recordNames in SharedSync
+            # Those found in SharedSync are SharedSync photos.
+            if _all_masters:
+                _ss_master_hits = _lookup_masters(
+                    _ss_ep, _ss_params, _ss_session, _ss_zone_id,
+                    list(_all_masters.keys()),
+                    label=f"{alb_name[:20]}/ss-id-check")
                 logs.append(("info",
-                             f"[{alb_name}] {_zone_label}: "
-                             f"{len(_masters)} master recs, "
-                             f"{len(_rel_ids)} relation IDs"))
+                             f"[{alb_name}] SharedSync lookup of "
+                             f"{len(_all_masters)} PS masters → "
+                             f"{len(_ss_master_hits)} in SharedSync"))
+                for _rn, _mr in _ss_master_hits.items():
+                    if _rn not in _seen_ids:
+                        _seen_ids.add(_rn)
+                        _ss_photos.append(
+                            _photo_from_master(_mr, _all_assets.get(_rn)))
+
+            # ── Strategy B: look up stubs in SharedSync (cross-zone refs) ──
+            # The same stubs also exist in PrimarySync but as CPLAsset, not
+            # CPLMaster, so no need to look them up there.
+            if _rel_ids:
+                _ss_stub_hits = _lookup_masters(
+                    _ss_ep, _ss_params, _ss_session, _ss_zone_id,
+                    _rel_ids,
+                    label=f"{alb_name[:20]}/ss-stubs")
+                logs.append(("info",
+                             f"[{alb_name}] SharedSync lookup of "
+                             f"{len(_rel_ids)} stubs → "
+                             f"{len(_ss_stub_hits)} hits"))
+                for _rn, _mr in _ss_stub_hits.items():
+                    if _rn not in _seen_ids:
+                        _seen_ids.add(_rn)
+                        _ss_photos.append(
+                            _photo_from_master(_mr, _all_assets.get(_rn)))
 
             logs.append(("info",
                          f"[{alb_name}] {len(_ss_photos)} SharedSync photos "
