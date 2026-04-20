@@ -459,11 +459,14 @@ class ProcessManager:
         # Instead, query the private endpoint directly and decode album names.
         import base64 as _b64, urllib.parse as _up, json as _json
         _ps_ep = icloud.photos.get_service_endpoint("private")
+        # Use the minimal zone_id format — exactly what icloudpd uses.
+        # The full zone_id (with ownerRecordName + zoneType) causes
+        # CPLContainerRelationLiveByAssetDate to return fewer records.
         _ps_zone = {"zoneName": "PrimarySync"}
-        # Also try with the full zone ID returned by zones/list (includes ownerRecordName)
+        _ps_zone_full = _ps_zone  # keep reference for diagnostics
         for _pz in _private_zones:
             if _pz["zoneID"]["zoneName"] == "PrimarySync":
-                _ps_zone = _pz["zoneID"]
+                _ps_zone_full = _pz["zoneID"]
                 break
         logs.append(("info", f"PrimarySync zone ID: {_ps_zone}"))
 
@@ -646,6 +649,50 @@ class ProcessManager:
         _ss_params  = shared_svc.params
         _ss_zone_id = shared_svc.zone_id
         _ss_session = shared_svc.session
+
+        # ── Diagnostic: scan CPLContainerRelation unfiltered in both zones ──
+        # "not marked indexable" BAD_REQUEST only applies to filtered queries;
+        # an unfiltered scan may work and reveals where album membership lives.
+        # Also scan SharedSync with CPLContainerRelationLiveByAssetDate (no
+        # parentId) to check if the sort-index exists there with containerId.
+        for _dz_label, _dz_ep, _dz_params, _dz_zone, _dz_sess in [
+            ("PrimarySync", _ps_ep, icloud.photos.params, _ps_zone,
+             icloud.photos.session),
+            ("SharedSync", _ss_ep, _ss_params, _ss_zone_id, _ss_session),
+        ]:
+            for _dz_rt in ("CPLContainerRelation",
+                           "CPLContainerRelationLiveByAssetDate"):
+                try:
+                    _dz_body = _json.dumps({
+                        "query": {"recordType": _dz_rt},
+                        "resultsLimit": 10,
+                        "desiredKeys": ["containerId", "itemId", "position",
+                                        "isKeyAsset", "parentId"],
+                        "zoneID": _dz_zone,
+                    })
+                    _dz_r = _dz_sess.post(
+                        f"{_dz_ep}/records/query?{_up.urlencode(_dz_params)}",
+                        data=_dz_body,
+                        headers={"Content-type": "text/plain"},
+                        timeout=30)
+                    _dz_recs = _dz_r.json().get("records", [])
+                    if _dz_recs:
+                        _sample = _dz_recs[0]
+                        logs.append(("info",
+                                     f"DIAG {_dz_label}/{_dz_rt}: "
+                                     f"{len(_dz_recs)} records, "
+                                     f"sample fields={list(_sample.get('fields',{}).keys())}, "
+                                     f"containerId={_sample.get('fields',{}).get('containerId',{}).get('value','?')}, "
+                                     f"itemId={_sample.get('fields',{}).get('itemId',{}).get('value','?')}"))
+                    else:
+                        _dz_raw = str(_dz_r.json())[:200]
+                        logs.append(("info",
+                                     f"DIAG {_dz_label}/{_dz_rt}: "
+                                     f"0 records (HTTP {_dz_r.status_code}): "
+                                     f"{_dz_raw}"))
+                except Exception as _dze:
+                    logs.append(("info",
+                                 f"DIAG {_dz_label}/{_dz_rt} failed: {_dze}"))
 
         def _lookup_masters(ep, params, session, zone_id, record_names,
                             label=""):
