@@ -283,15 +283,13 @@ class ProcessManager:
                                 f"──── Syncing Shared Library: {shared_lib} ────")
 
                 # In multi-album mode, discover SharedSync photos that belong to
-                # PrimarySync albums using a cross-zone CloudKit query via
-                # pyicloud_ipd.  Albums exist only in PrimarySync; SharedSync has
-                # no user-created albums so icloudpd --album crashes there.
-                # Instead we query the SharedSync zone directly using the
-                # PrimarySync album's parentId filter — iCloud stores cross-library
-                # ContainerRelation records in the photo's zone (SharedSync).
+                # PrimarySync albums.  We query the SharedSync zone's own
+                # CPLContainerRelationLiveByAssetDate sort-index using each
+                # PrimarySync album's record name as parentId — iCloud stores
+                # cross-library membership in the photo's zone.
                 if multi_album and albums:
                     await self._log(run_id, job_id, "info",
-                                    "Discovering SharedSync photos per album via pyicloud_ipd …")
+                                    "Discovering SharedSync photos per album …")
                     await self._sync_shared_photos_by_ps_albums(
                         job, run_id, job_id, albums)
 
@@ -331,12 +329,11 @@ class ProcessManager:
         Synchronous worker (runs in a thread executor) that uses pyicloud_ipd
         to download SharedSync photos belonging to PrimarySync albums.
 
-        Strategy: iCloud stores CPLContainerRelation records for cross-library
-        album membership in the *photo's* zone (SharedSync), tagged with the
-        PrimarySync album's record name as parentId.  We create a PhotoAlbum
-        proxy that points at the SharedSync zone but uses the PrimarySync
-        album's container filter, so the CloudKit query returns exactly the
-        SharedSync photos that are in that album.
+        iCloud stores CPLContainerRelationLiveByAssetDate records for
+        cross-library album membership in the *photo's* zone (SharedSync),
+        tagged with the PrimarySync album's record name as parentId.  We query
+        the SharedSync sort-index directly with that parentId to get the
+        SharedSync photos that are in each album.
 
         Returns a list of (level, message) tuples for the caller to log.
         """
@@ -650,50 +647,6 @@ class ProcessManager:
         _ss_zone_id = shared_svc.zone_id
         _ss_session = shared_svc.session
 
-        # ── Diagnostic: scan CPLContainerRelation unfiltered in both zones ──
-        # "not marked indexable" BAD_REQUEST only applies to filtered queries;
-        # an unfiltered scan may work and reveals where album membership lives.
-        # Also scan SharedSync with CPLContainerRelationLiveByAssetDate (no
-        # parentId) to check if the sort-index exists there with containerId.
-        for _dz_label, _dz_ep, _dz_params, _dz_zone, _dz_sess in [
-            ("PrimarySync", _ps_ep, icloud.photos.params, _ps_zone,
-             icloud.photos.session),
-            ("SharedSync", _ss_ep, _ss_params, _ss_zone_id, _ss_session),
-        ]:
-            for _dz_rt in ("CPLContainerRelation",
-                           "CPLContainerRelationLiveByAssetDate"):
-                try:
-                    _dz_body = _json.dumps({
-                        "query": {"recordType": _dz_rt},
-                        "resultsLimit": 10,
-                        "desiredKeys": ["containerId", "itemId", "position",
-                                        "isKeyAsset", "parentId"],
-                        "zoneID": _dz_zone,
-                    })
-                    _dz_r = _dz_sess.post(
-                        f"{_dz_ep}/records/query?{_up.urlencode(_dz_params)}",
-                        data=_dz_body,
-                        headers={"Content-type": "text/plain"},
-                        timeout=30)
-                    _dz_recs = _dz_r.json().get("records", [])
-                    if _dz_recs:
-                        _sample = _dz_recs[0]
-                        logs.append(("info",
-                                     f"DIAG {_dz_label}/{_dz_rt}: "
-                                     f"{len(_dz_recs)} records, "
-                                     f"sample fields={list(_sample.get('fields',{}).keys())}, "
-                                     f"containerId={_sample.get('fields',{}).get('containerId',{}).get('value','?')}, "
-                                     f"itemId={_sample.get('fields',{}).get('itemId',{}).get('value','?')}"))
-                    else:
-                        _dz_raw = str(_dz_r.json())[:200]
-                        logs.append(("info",
-                                     f"DIAG {_dz_label}/{_dz_rt}: "
-                                     f"0 records (HTTP {_dz_r.status_code}): "
-                                     f"{_dz_raw}"))
-                except Exception as _dze:
-                    logs.append(("info",
-                                 f"DIAG {_dz_label}/{_dz_rt} failed: {_dze}"))
-
         def _lookup_masters(ep, params, session, zone_id, record_names,
                             label=""):
             """
@@ -770,72 +723,90 @@ class ProcessManager:
 
             # ── Step 1: find SharedSync photos for this album ──────────────
             #
-            # Strategy:
-            #   A) Query PrimarySync sort-index with desiredKeys.  With these
-            #      keys CloudKit expands cross-zone references and returns
-            #      CPLMaster records for SharedSync photos alongside PrimarySync
-            #      ones.  We then batch-lookup all returned recordNames in
-            #      SharedSync to identify which are SharedSync photos.
+            # Strategy C (primary): query the SharedSync zone's own sort-index
+            #   using the PrimarySync album record name as parentId.  iCloud
+            #   stores cross-zone membership in the *photo's* zone; if this
+            #   works it returns the SharedSync photos directly.
             #
-            #   B) For any CPLContainerRelation stubs still returned (itemId
-            #      field), look them up in BOTH zones (same and SharedSync) —
-            #      the cross-zone ones live in SharedSync.
+            # Strategy A (fallback): query PrimarySync sort-index, then lookup
+            #   the returned record names in SharedSync to see if any of them
+            #   are actually SharedSync photos with the same ID.
             #
-            #   C) Log raw responses when 0 records come back so we can
-            #      diagnose the CloudKit data structure for this account.
+            # Strategy B (fallback): look up any CPLContainerRelation stubs
+            #   returned by the PrimarySync sort-index in the SharedSync zone.
 
             _ss_photos: list = []
             _seen_ids: set = set()
 
+            # ── Strategy C ─────────────────────────────────────────────────
+            # Query the SharedSync zone's CPLContainerRelationLiveByAssetDate
+            # using the PrimarySync album's folder_record_name as parentId.
+            _all_masters_ss: dict = {}  # recordName → CPLMaster from SharedSync
+            _all_assets_ss: dict = {}   # masterRecordName → CPLAsset from SS
+            for _rr in _rel_query_pages(
+                    _ss_ep, _ss_params, _ss_session, _ss_zone_id,
+                    folder_record_name,
+                    label=f"SS/{folder_record_name[:12]}"):
+                _rt = _rr.get("recordType", "")
+                _rr_fields = _rr.get("fields", {})
+                if _rt == "CPLMaster":
+                    _all_masters_ss[_rr["recordName"]] = _rr
+                elif _rt == "CPLAsset":
+                    _mid = (_rr_fields.get("masterRef", {})
+                            .get("value", {}).get("recordName"))
+                    if _mid:
+                        _all_assets_ss[_mid] = _rr
+
+            logs.append(("info",
+                         f"[{alb_name}] SharedSync sort-index (Strategy C): "
+                         f"{len(_all_masters_ss)} masters"))
+            for _rn, _mr in _all_masters_ss.items():
+                if _rn not in _seen_ids:
+                    _seen_ids.add(_rn)
+                    _ss_photos.append(
+                        _photo_from_master(_mr, _all_assets_ss.get(_rn)))
+
+            # ── PrimarySync sort-index (for Strategies A & B) ─────────────
             # All CPLMaster records found via sort-index query
             _all_masters: dict = {}   # recordName → CPLMaster record
             _all_assets: dict = {}    # masterRecordName → CPLAsset record
             _rel_ids: list = []       # itemId / assetId stubs to look up
-            _unknown_types: set = set()
 
-            for _parent_id in [folder_record_name]:
-                for _rr in _rel_query_pages(
-                        _ps_ep, icloud.photos.params,
-                        icloud.photos.session, _ps_zone,
-                        _parent_id,
-                        label=f"PS/{_parent_id[:12]}"):
-                    _rt = _rr.get("recordType", "")
-                    _rr_fields = _rr.get("fields", {})
-                    if _rt == "CPLMaster":
-                        _all_masters[_rr["recordName"]] = _rr
-                    elif _rt == "CPLAsset":
-                        _mid = (_rr_fields
-                                .get("masterRef", {})
-                                .get("value", {})
-                                .get("recordName"))
-                        if _mid:
-                            _all_assets[_mid] = _rr
+            for _rr in _rel_query_pages(
+                    _ps_ep, icloud.photos.params,
+                    icloud.photos.session, _ps_zone,
+                    folder_record_name,
+                    label=f"PS/{folder_record_name[:12]}"):
+                _rt = _rr.get("recordType", "")
+                _rr_fields = _rr.get("fields", {})
+                if _rt == "CPLMaster":
+                    _all_masters[_rr["recordName"]] = _rr
+                elif _rt == "CPLAsset":
+                    _mid = (_rr_fields.get("masterRef", {})
+                            .get("value", {}).get("recordName"))
+                    if _mid:
+                        _all_assets[_mid] = _rr
+                else:
+                    _aid = (
+                        _rr_fields.get("itemId", {}).get("value")
+                        or _rr_fields.get("assetId", {}).get("value")
+                    )
+                    if isinstance(_aid, str) and _aid:
+                        _rel_ids.append(_aid)
                     else:
-                        # CPLContainerRelation stub (cross-zone, no desiredKeys
-                        # expansion, or unexpected record type)
-                        _aid = (
-                            _rr_fields.get("itemId", {}).get("value")
-                            or _rr_fields.get("assetId", {}).get("value")
-                        )
-                        if isinstance(_aid, str) and _aid:
-                            _rel_ids.append(_aid)
-                        else:
-                            for _fn, _fv in _rr_fields.items():
-                                if _fv.get("type") == "REFERENCE":
-                                    _rv = _fv.get("value", {})
-                                    if isinstance(_rv, dict):
-                                        _ref_rn = _rv.get("recordName")
-                                        if _ref_rn:
-                                            _rel_ids.append(_ref_rn)
-                                            break
-                            else:
-                                _unknown_types.add(_rt)
+                        for _fn, _fv in _rr_fields.items():
+                            if _fv.get("type") == "REFERENCE":
+                                _rv = _fv.get("value", {})
+                                if isinstance(_rv, dict):
+                                    _ref_rn = _rv.get("recordName")
+                                    if _ref_rn:
+                                        _rel_ids.append(_ref_rn)
+                                        break
 
             logs.append(("info",
                          f"[{alb_name}] PrimarySync sort-index: "
                          f"{len(_all_masters)} masters, "
-                         f"{len(_rel_ids)} stubs, "
-                         f"unknown={_unknown_types}"))
+                         f"{len(_rel_ids)} stubs"))
 
             # ── Strategy A: batch-lookup all master recordNames in SharedSync
             # Those found in SharedSync are SharedSync photos.
