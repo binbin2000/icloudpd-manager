@@ -675,44 +675,83 @@ class ProcessManager:
                             if _mid:
                                 _asset_recs[_mid] = _rr
                         else:
-                            # Try STRING assetId first (same-zone reference)
-                            _aid = _rr_fields.get("assetId", {}).get("value")
+                            # CPLContainerRelationLiveByAssetDate query may
+                            # return:
+                            #  • CPLContainerRelationLiveByAssetDate records
+                            #    with STRING assetId  (same-zone)
+                            #  • CPLContainerRelation records with STRING
+                            #    itemId  (cross-zone SharedSync reference)
+                            #  • REFERENCE-type fields for other cross-zone links
+                            _aid = (
+                                _rr_fields.get("assetId", {}).get("value")
+                                or _rr_fields.get("itemId", {}).get("value")
+                            )
                             if isinstance(_aid, str) and _aid:
                                 _rel_ids.append(_aid)
                             else:
-                                # Try any REFERENCE-type field that could be
-                                # a cross-zone link to SharedSync.
-                                _ref_rn = None
-                                _ref_zone = ""
+                                # Fallback: scan for any REFERENCE-type field
                                 for _fn, _fv in _rr_fields.items():
                                     if _fv.get("type") == "REFERENCE":
                                         _rv = _fv.get("value", {})
-                                        if isinstance(_rv, dict) and _rv.get("recordName"):
-                                            _ref_rn = _rv["recordName"]
-                                            _ref_zone = (_rv.get("zoneID", {})
-                                                         .get("zoneName", ""))
-                                            break
-                                if _ref_rn:
-                                    _rel_ids.append(_ref_rn)
+                                        if isinstance(_rv, dict):
+                                            _ref_rn = _rv.get("recordName")
+                                            if _ref_rn:
+                                                _rel_ids.append(_ref_rn)
+                                                break
                                 else:
                                     _unknown_types.add(_rt)
 
-                                # Log field names+types of the first such record
-                                if not _logged_ct_fields and _rt:
-                                    _logged_ct_fields = True
-                                    _fsummary = {
-                                        fn: fv.get("type", "?")
-                                        for fn, fv in _rr_fields.items()
-                                    }
-                                    logs.append(("info",
-                                                 f"[{alb_name}] {_zone_label} "
-                                                 f"{_rt} fields: {_fsummary}"))
+                # ── Fallback: direct CPLContainerRelation query ───────────
+                # If the sort-index query above found nothing (albums where
+                # ALL photos are in SharedSync), try querying the underlying
+                # CPLContainerRelation record type directly, filtering by
+                # containerId (the album record name).  This bypasses the
+                # sort index and may surface cross-zone relations not indexed.
+                if not _masters and not _rel_ids:
+                    for _parent_id in _parents:
+                        try:
+                            _ct_url = (f"{_zone_ep}/records/query?"
+                                       f"{_up.urlencode(_zone_params)}")
+                            _ct_body = _json.dumps({
+                                "query": {
+                                    "filterBy": [
+                                        {"fieldName": "containerId",
+                                         "comparator": "EQUALS",
+                                         "fieldValue": {"type": "STRING",
+                                                        "value": _parent_id}},
+                                    ],
+                                    "recordType": "CPLContainerRelation",
+                                },
+                                "resultsLimit": 500,
+                                "zoneID": _zone_id,
+                            })
+                            _ct_r = _zone_session.post(
+                                _ct_url, data=_ct_body,
+                                headers={"Content-type": "text/plain"},
+                                timeout=30)
+                            _ct_recs = _ct_r.json().get("records", [])
+                            logs.append(("info",
+                                         f"[{alb_name}] {_zone_label} "
+                                         f"direct CPLContainerRelation query: "
+                                         f"{len(_ct_recs)} records"))
+                            for _cr in _ct_recs:
+                                _cr_fields = _cr.get("fields", {})
+                                _item = (
+                                    _cr_fields.get("itemId", {}).get("value")
+                                    or _cr_fields.get("assetId", {}).get("value")
+                                )
+                                if isinstance(_item, str) and _item:
+                                    _rel_ids.append(_item)
+                        except Exception as _cte:
+                            logs.append(("info",
+                                         f"[{alb_name}] {_zone_label} "
+                                         f"direct CPLContainerRelation failed: "
+                                         f"{_cte}"))
 
                 if _unknown_types:
                     logs.append(("info",
                                  f"[{alb_name}] {_zone_label}: "
-                                 f"unknown record types (no assetId): "
-                                 f"{_unknown_types}"))
+                                 f"unknown record types: {_unknown_types}"))
 
                 # Build PhotoAssets for CPLMaster records returned directly
                 for _mr_id, _mr in _masters.items():
